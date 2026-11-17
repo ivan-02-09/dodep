@@ -125,14 +125,42 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # One Dockerfile per language, selected by the service name. The
+      # per-service files this used to point at no longer exist (they pinned
+      # golang:1.21 / rust:1.75 and only built the auth binary), so the build
+      # failed with "Dockerfile not found" for every matrix entry.
+      - name: Resolve build inputs
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          svc="${{ matrix.service }}"
+          case "$svc" in
+            betting-engine|wallet-core|websocket-gateway)
+              echo "dockerfile=infra/docker/Dockerfile.rust" >> "$GITHUB_OUTPUT"
+              echo "args=[{\"key\":\"SERVICE_NAME\",\"value\":\"$svc\"},{\"key\":\"PROFILE\",\"value\":\"release\"}]" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "dockerfile=infra/docker/Dockerfile.go" >> "$GITHUB_OUTPUT"
+              arg="services/go/$svc"
+              extra=""
+              # payment is the only module whose main package is not at the root.
+              if [ "$svc" = "payment" ]; then
+                extra=",{\"key\":\"CMD_PATH\",\"value\":\"cmd/server\"}"
+              fi
+              echo "args=[{\"key\":\"SERVICE_PATH\",\"value\":\"$arg\"},{\"key\":\"VERSION\",\"value\":\"${{ needs.pre-checks.outputs.version }}\"}$extra]" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
       - name: Build, scan and push Docker image
         id: build
         uses: ./.github/actions/docker-build-push
         with:
           registry: ${{ env.REGISTRY }}
           image-name: ${{ env.IMAGE_NAME_PREFIX }}/${{ matrix.service }}
-          dockerfile: services/${{ startsWith(matrix.service, 'betting') || startsWith(matrix.service, 'wallet') || startsWith(matrix.service, 'websocket') && 'rust' || 'go' }}/${{ matrix.service }}/Dockerfile
+          dockerfile: ${{ steps.resolve.outputs.dockerfile }}
           context: .
+          build-args: ${{ steps.resolve.outputs.args }}
           scan-severity: 'HIGH'
           push-image: 'true'
           tags: |

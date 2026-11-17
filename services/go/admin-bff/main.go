@@ -47,6 +47,13 @@ func main() {
 	log, _ := zap.NewProduction()
 	defer log.Sync()
 
+	// Refuse to start with an unverifiable JWT key or clients pointing at
+	// localhost: the BFF would boot "healthy" while every privileged route was
+	// either unauthenticated (the well-known placeholder secret) or dead.
+	if err := cfg.Validate(); err != nil {
+		log.Fatal("Invalid configuration", zap.Error(err))
+	}
+
 	dbPool, err := pgxpool.New(context.Background(), cfg.DatabaseURL)
 	if err != nil {
 		log.Fatal("Failed to connect to database", zap.Error(err))
@@ -77,7 +84,7 @@ func main() {
 	app.Use(recover.New())
 	// CORS: allowlist from $CORS_ORIGINS (comma-separated). Wildcard "*"
 	// is stripped. Dev fallback covers local admin SPA on :3001.
-	// In production set $CORS_ORIGINS explicitly via Helm values.
+	// In production Config.Validate rejects an empty or wildcard list.
 	allowedOrigins := corsOriginsFromEnv("http://localhost:3001, http://127.0.0.1:3001")
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     allowedOrigins,

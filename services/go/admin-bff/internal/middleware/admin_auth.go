@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"crypto/ed25519"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -13,21 +15,70 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// loadEd25519PublicKey loads an Ed25519 public key from a PEM file path.
-// Returns nil if path is empty or file unreadable (falls back to HMAC).
+// loadEd25519PublicKey resolves the token verification key from:
+//
+//  1. JWT_ED25519_PUBLIC_KEY_FILE — a PEM (or raw DER) file, and
+//  2. JWT_ED25519_PUBLIC_KEY — the base64 form the auth service issues and
+//     .env.production.example documents.
+//
+// Only the file form used to be read, so a deployment that configured the
+// base64 variable (the documented contract) silently fell back to HMAC and
+// rejected every EdDSA token minted by the admin service.
+//
+// Returns nil when nothing usable is configured; the caller then falls back to
+// HMAC.
 func loadEd25519PublicKey(path string) ed25519.PublicKey {
-	if path == "" {
+	if path != "" {
+		if raw, err := os.ReadFile(path); err == nil {
+			if key := parseEd25519PublicKeyPEM(raw); key != nil {
+				return key
+			}
+		}
+	}
+	return parseEd25519PublicKeyBase64(os.Getenv("JWT_ED25519_PUBLIC_KEY"))
+}
+
+func parseEd25519PublicKeyPEM(raw []byte) ed25519.PublicKey {
+	block, _ := pem.Decode(raw)
+	if block != nil {
+		raw = block.Bytes
+	}
+	return parseEd25519PublicKeyDER(raw)
+}
+
+func parseEd25519PublicKeyBase64(encoded string) ed25519.PublicKey {
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" {
 		return nil
 	}
-	raw, err := os.ReadFile(path)
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		// Tolerate the URL-safe / unpadded form too, so an operator copy-paste
+		// cannot silently disable token verification.
+		decoded, err = base64.RawURLEncoding.DecodeString(strings.TrimRight(encoded, "="))
+		if err != nil {
+			return nil
+		}
+	}
+	return parseEd25519PublicKeyDER(decoded)
+}
+
+// parseEd25519PublicKeyDER accepts either the raw 32-byte key (what the auth
+// service emits after base64) or a DER-encoded SubjectPublicKeyInfo (what
+// `openssl pkey -pubout -outform DER` produces).
+func parseEd25519PublicKeyDER(raw []byte) ed25519.PublicKey {
+	if len(raw) == ed25519.PublicKeySize {
+		return ed25519.PublicKey(raw)
+	}
+	parsed, err := x509.ParsePKIXPublicKey(raw)
 	if err != nil {
 		return nil
 	}
-	block, _ := pem.Decode(raw)
-	if block == nil {
+	pub, ok := parsed.(ed25519.PublicKey)
+	if !ok {
 		return nil
 	}
-	return ed25519.PublicKey(block.Bytes)
+	return pub
 }
 
 func AdminAuth(jwtSecret string, db *pgxpool.Pool) fiber.Handler {

@@ -1,10 +1,22 @@
 # Multi-stage Dockerfile for Rust services
 # Opus Casino - Betting Engine, Wallet Core, WebSocket Gateway
+#
+# Build context is the repository root; SERVICE_NAME selects the crate:
+#   docker build -f infra/docker/Dockerfile.rust \
+#     --build-arg SERVICE_NAME=wallet-core .
+#
+# NOTE: the argument is SERVICE_NAME. docker-compose used to pass `SERVICE`,
+# which is not declared here, so every image silently became betting-engine.
 
 # =============================================================================
 # Stage 1: Builder
 # =============================================================================
-FROM rust:slim-bookworm AS builder
+# 1.75 cannot even read the committed lockfile:
+#   lock file version `4` was found, but this version of Cargo does not
+#   understand this lock file
+# and edition2024 crates (aes 0.9 -> cpufeatures 0.3) need >= 1.85. Same floor
+# as .github/workflows/ci.yaml.
+FROM rust:1.85-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
@@ -20,25 +32,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src/services/rust
 
+# The workspace root and every crate manifest go in first so `cargo build` can
+# resolve dependencies without re-copying sources on each iteration.
 COPY libs/shared/rust /src/libs/shared/rust
 COPY libs/proto /src/libs/proto
 COPY libs/migrations /src/libs/migrations
+COPY services/rust/Cargo.toml services/rust/Cargo.lock /src/services/rust/
 COPY services/rust /src/services/rust
 
 ARG SERVICE_NAME=betting-engine
 ARG PROFILE=release
 
-RUN cargo build --package ${SERVICE_NAME} --release
+# `cargo build` resolves the workspace, so Cargo.lock must be present (it is
+# committed) and the crate name must exist in [workspace] members.
+RUN cargo build --package "${SERVICE_NAME}" --profile "${PROFILE}"
 
 # =============================================================================
 # Stage 2: Runtime
 # =============================================================================
 FROM debian:bookworm-slim AS runtime
 
+# curl is required: the container healthchecks in docker-compose run
+# `curl -f http://localhost:<port>/health` inside the image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --disabled-password --gecos '' --uid 10001 --shell /usr/sbin/nologin app
 
 ARG SERVICE_NAME=betting-engine
 
@@ -50,5 +71,7 @@ ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 
 EXPOSE 8080
+
+USER 10001:10001
 
 ENTRYPOINT ["/usr/local/bin/app"]

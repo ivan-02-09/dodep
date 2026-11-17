@@ -94,7 +94,7 @@ describe("financeService.request shaping", () => {
     const [config] = sent;
     expect(config.method).toBe("post");
     expect(requestUrl(config)).toBe(
-      `${API_BASE_URL}/admin/finance/withdrawals/wd-7/approve`,
+      `${API_BASE_URL}/admin/withdrawals/wd-7/approve`,
     );
     expect(config.data).toBeUndefined();
   });
@@ -105,7 +105,7 @@ describe("financeService.request shaping", () => {
     const [config] = sent;
     expect(config.method).toBe("post");
     expect(requestUrl(config)).toBe(
-      `${API_BASE_URL}/admin/finance/withdrawals/wd-7/reject`,
+      `${API_BASE_URL}/admin/withdrawals/wd-7/decline`,
     );
     expect(bodyOf(config)).toEqual({ reason: "KYC documents expired" });
   });
@@ -121,7 +121,7 @@ describe("financeService.request shaping", () => {
     const [config] = sent;
     expect(config.method).toBe("post");
     expect(requestUrl(config)).toBe(
-      `${API_BASE_URL}/admin/finance/users/user-9/adjust-balance`,
+      `${API_BASE_URL}/admin/players/user-9/adjust-balance`,
     );
     expect(bodyOf(config)).toEqual({
       amount: "-1250.55",

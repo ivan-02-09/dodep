@@ -1,21 +1,29 @@
-# Multi-stage build for Next.js 14 web app
-# Build context: apps/web/
+# Multi-stage build for the Next.js 14 web app.
+#
+# Build context is the REPOSITORY ROOT (see docker-compose.prod.yml). The app is
+# built from apps/web but npm needs the monorepo root for a deterministic
+# install, and keeping one context lets .dockerignore exclude node_modules /
+# .next once instead of per-app ignores.
+
 FROM node:20-alpine AS base
-RUN apk add --no-cache libc6-compat
+RUN apk add --no-cache libc6-compat curl
+WORKDIR /app
 
 # ─── deps stage ─────────────────────────────────────────────────
 FROM base AS deps
-WORKDIR /app
-COPY package.json package-lock.json* ./
+COPY apps/web/package.json apps/web/package-lock.json ./
 RUN npm ci
 
 # ─── builder stage ──────────────────────────────────────────────
 FROM base AS builder
 WORKDIR /app
 
-# Build-time env vars passed from docker-compose
+# Build-time env vars passed from docker-compose. NEXT_PUBLIC_* are inlined into
+# the client bundle at build time, so they must be present here (not only at
+# runtime). Defaults are relative URLs: the browser is served by nginx, which
+# proxies /api and /ws on the same origin.
 ARG NEXT_PUBLIC_API_URL=/api
-ARG NEXT_PUBLIC_WS_URL=wss://localhost/ws
+ARG NEXT_PUBLIC_WS_URL=/ws
 ARG NEXT_PUBLIC_SENTRY_DSN=""
 ARG NEXT_PUBLIC_APP_ENV=production
 
@@ -26,7 +34,7 @@ ENV NEXT_PUBLIC_APP_ENV=${NEXT_PUBLIC_APP_ENV}
 ENV NEXT_TELEMETRY_DISABLED=1
 
 COPY --from=deps /app/node_modules ./node_modules
-COPY . .
+COPY apps/web ./
 
 RUN npm run build
 
@@ -40,9 +48,12 @@ ENV NEXT_TELEMETRY_DISABLED=1
 RUN addgroup --system --gid 1001 nodejs \
  && adduser  --system --uid 1001 nextjs
 
-COPY --from=builder /app/public ./public
+# The standalone bundle does not include public/ or .next/static; both are
+# copied explicitly. They only exist if the app has them, hence the separate
+# COPY of public from the repository (apps/web/public is tracked).
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
 USER nextjs
 EXPOSE 3000

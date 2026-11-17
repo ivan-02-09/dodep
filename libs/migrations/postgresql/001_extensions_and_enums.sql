@@ -7,10 +7,33 @@
 -- EXTENSIONS
 -- ============================================================
 
-CREATE EXTENSION IF NOT EXISTS "citus";
+-- pgcrypto is the only hard requirement (gen_random_uuid, digest, crypt).
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-CREATE EXTENSION IF NOT EXISTS "pg_stat_statements";
-CREATE EXTENSION IF NOT EXISTS "pg_partman";
+
+-- The remaining three are optional and environment dependent:
+--   * citus            - only present in a Citus image; needed for sharding
+--                        (see 008_rls_and_triggers.sql, which degrades
+--                        gracefully when the extension is absent)
+--   * pg_partman       - absent from most images; partitioning is a scale-out
+--                        concern and no migration creates a partition yet
+--   * pg_stat_statements - raises "must be loaded via shared_preload_libraries"
+--                        on every stock image unless configured
+--
+-- A plain `CREATE EXTENSION` for any of these aborted the entire migration run
+-- on a stock PostgreSQL, so they are attempted and skipped with a notice.
+DO $$
+DECLARE
+    ext TEXT;
+BEGIN
+    FOREACH ext IN ARRAY ARRAY['citus', 'pg_partman', 'pg_stat_statements'] LOOP
+        BEGIN
+            EXECUTE format('CREATE EXTENSION IF NOT EXISTS %I', ext);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'optional extension % not available: %', ext, SQLERRM;
+        END;
+    END LOOP;
+END
+$$;
 
 -- ============================================================
 -- HELPER FUNCTION: auto-update updated_at

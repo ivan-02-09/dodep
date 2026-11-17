@@ -30,8 +30,9 @@ spec:
         - name: http
           containerPort: 8080
           protocol: TCP
+        # AppConfig::default_grpc_port() is 9090.
         - name: grpc
-          containerPort: 50051
+          containerPort: 9090
           protocol: TCP
         envFrom:
         - configMapRef:
@@ -45,15 +46,17 @@ spec:
           limits:
             cpu: "2000m"
             memory: "512Mi"
+        # axum exposes /healthz and /readyz (src/api/mod.rs); /health and
+        # /ready returned 404, so the pod never became ready.
         livenessProbe:
           httpGet:
-            path: /health
+            path: /healthz
             port: 8080
           initialDelaySeconds: 10
           periodSeconds: 10
         readinessProbe:
           httpGet:
-            path: /ready
+            path: /readyz
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 5
@@ -93,8 +96,8 @@ spec:
     port: 8080
     targetPort: 8080
   - name: grpc
-    port: 50051
-    targetPort: 50051
+    port: 9090
+    targetPort: 9090
   type: ClusterIP
 ---
 apiVersion: policy/v1

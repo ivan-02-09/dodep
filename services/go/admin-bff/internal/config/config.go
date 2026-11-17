@@ -1,12 +1,16 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"time"
 )
 
+// Env is the deployment environment (APP_ENV). "development" relaxes the
+// startup secret checks; any other value must pass Validate.
 type Config struct {
+	Env             string
 	HTTPPort        string
 	DatabaseURL     string
 	RedisAddr       string
@@ -19,6 +23,11 @@ type Config struct {
 	VaultTransitKey string
 	RedpandaEnabled bool
 	RedpandaBrokers []string
+	// CORSOrigins is the browser origin allowlist, comma-separated.
+	CORSOrigins string
+	// CookieSecure marks the admin session cookie Secure; must stay true in
+	// production (plain HTTP would leak the session on any downgrade).
+	CookieSecure bool
 
 	AuthService    ServiceConfig
 	UserService    ServiceConfig
@@ -36,6 +45,7 @@ type ServiceConfig struct {
 func Load() *Config {
 	redpandaBrokers := splitAndTrim(getEnv("REDPANDA_BROKERS", ""))
 	return &Config{
+		Env:             getEnv("APP_ENV", "development"),
 		HTTPPort:        getEnv("HTTP_PORT", "8080"),
 		DatabaseURL:     getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/opus?sslmode=disable"),
 		RedisAddr:       getEnv("REDIS_ADDR", "localhost:6379"),
@@ -48,6 +58,8 @@ func Load() *Config {
 		VaultTransitKey: getEnv("VAULT_TRANSIT_KEY", ""),
 		RedpandaEnabled: getEnv("REDPANDA_ENABLED", "false") == "true",
 		RedpandaBrokers: redpandaBrokers,
+		CORSOrigins:     getEnv("CORS_ORIGINS", ""),
+		CookieSecure:    getEnv("COOKIE_SECURE", "true") == "true",
 
 		AuthService: ServiceConfig{
 			Address: getEnv("AUTH_SERVICE_ADDR", "localhost:50051"),
@@ -66,6 +78,86 @@ func Load() *Config {
 			Timeout: parseDuration(getEnv("BETTING_ENGINE_TIMEOUT", "10s")),
 		},
 	}
+}
+
+// defaultJWTSecret is the placeholder that shipped in the deployment manifests.
+// A service that starts with it accepts tokens anyone can mint, so outside
+// development it is treated as "not configured" rather than as a valid secret.
+const defaultJWTSecret = "dev-secret-change-me"
+
+// Validate reports configuration the process must not run with. It mirrors
+// services/go/user: outside APP_ENV=development a usable JWT verification key
+// is mandatory, because the admin BFF is the only gate in front of every
+// privileged operation (balance adjustments, withdrawals, player data).
+func (c *Config) Validate() error {
+	if c == nil {
+		return fmt.Errorf("config is nil")
+	}
+	if c.Env == "development" {
+		return nil
+	}
+
+	misconfigured := []string{}
+	for name, value := range map[string]string{
+		"DATABASE_URL": c.DatabaseURL,
+		"REDIS_ADDR":   c.RedisAddr,
+	} {
+		if strings.TrimSpace(value) == "" {
+			misconfigured = append(misconfigured, name+" is empty")
+		}
+	}
+
+	hmacUsable := c.JWTSecretKey != "" && c.JWTSecretKey != defaultJWTSecret
+	// EdDSA is the preferred mode. It is usable when either the base64 key pair
+	// (what auth and the deployment templates use) or the PEM file form is
+	// configured; the middleware's loader accepts both.
+	eddsaUsable := (os.Getenv("JWT_ED25519_PUBLIC_KEY") != "" &&
+		os.Getenv("JWT_ED25519_PRIVATE_KEY") != "") ||
+		os.Getenv("JWT_ED25519_PUBLIC_KEY_FILE") != ""
+	if !hmacUsable && !eddsaUsable {
+		if c.JWTSecretKey == defaultJWTSecret {
+			misconfigured = append(misconfigured,
+				"JWT_SECRET_KEY is still the default placeholder")
+		}
+		misconfigured = append(misconfigured,
+			"configure JWT_ED25519_PRIVATE_KEY + JWT_ED25519_PUBLIC_KEY "+
+				"(base64) or JWT_ED25519_PUBLIC_KEY_FILE; a non-default "+
+				"JWT_SECRET_KEY alone leaves tokens unverifiable across services")
+	}
+
+	for _, svc := range []struct {
+		name string
+		addr string
+	}{
+		{"AUTH_SERVICE_ADDR", c.AuthService.Address},
+		{"USER_SERVICE_ADDR", c.UserService.Address},
+		{"PAYMENT_SERVICE_ADDR", c.PaymentService.Address},
+		{"BETTING_ENGINE_ADDR", c.BettingEngine.Address},
+	} {
+		if strings.HasPrefix(svc.addr, "localhost") || strings.HasPrefix(svc.addr, "127.0.0.1") {
+			misconfigured = append(misconfigured,
+				fmt.Sprintf("%s resolves to the loopback interface (%s)", svc.name, svc.addr))
+		}
+	}
+
+	if !c.CookieSecure {
+		misconfigured = append(misconfigured,
+			"COOKIE_SECURE must be true outside development")
+	}
+	if strings.TrimSpace(c.CORSOrigins) == "" {
+		misconfigured = append(misconfigured, "CORS_ORIGINS is empty")
+	} else if strings.Contains(c.CORSOrigins, "*") {
+		// cors.New(AllowOrigins: "*", AllowCredentials: true) makes Fiber reflect
+		// the caller's Origin, which for a cookie-authenticated admin API is a
+		// straight CSRF hole.
+		misconfigured = append(misconfigured,
+			`CORS_ORIGINS must list explicit origins, not "*"`)
+	}
+
+	if len(misconfigured) > 0 {
+		return fmt.Errorf("invalid admin-bff configuration: %s", strings.Join(misconfigured, "; "))
+	}
+	return nil
 }
 
 func getEnv(key, fallback string) string {

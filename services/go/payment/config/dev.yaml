@@ -25,8 +25,11 @@ kafka:
     - localhost:9092
 
 # Secrets поставляются через ENV (см. dev.ps1 / dev.sh):
-# PAYMENT_NOWPAYMENTS_API_KEY    = S9ABM14-ZRW4V20-HS8C1SY-84MBY5P
-# PAYMENT_NOWPAYMENTS_IPN_SECRET = cpWmw0u7X4m2hO5HrnXbZVzc+vcgoFBI
+#   PAYMENT_NOWPAYMENTS_API_KEY     — свой тестовый ключ, НЕ коммитить;
+#   PAYMENT_NOWPAYMENTS_IPN_SECRET  — свой тестовый секрет, НЕ коммитить.
+# Раньше здесь лежали реальные ключи шлюза: они отозваны и заменены на
+# плейсхолдеры. Если в форке остались старые значения — перевыпустите ключи
+# в кабинете NOWPayments.
 nowpayments:
   base_url: https://api.nowpayments.io/v1
   ipn_callback_url: ""   # Необязателен в dev (используй ngrok для тестирования webhook)

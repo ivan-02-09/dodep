@@ -8,7 +8,13 @@ jest.mock("@/stores/auth-store", () => ({
   },
 }));
 
-import { ApiClientError, createApiClient, resolveApiBaseUrl, resolveAuthApiBaseUrl } from "./client";
+import {
+  ApiClientError,
+  createApiClient,
+  joinUrl,
+  resolveApiBaseUrl,
+  resolveAuthApiBaseUrl,
+} from "./client";
 
 describe("api client configuration", () => {
   test("prefers explicit auth API url when provided", () => {
@@ -26,8 +32,54 @@ describe("api client configuration", () => {
     expect(base).toBe("http://localhost:8080");
   });
 
-  test("uses default API url when env is empty", () => {
-    expect(resolveApiBaseUrl({})).toBe("http://localhost:8080");
+  test("defaults to a same-origin /api base when env is empty", () => {
+    // The browser must never be pointed at localhost in production: behind
+    // nginx the API lives on the same origin under /api.
+    expect(resolveApiBaseUrl({})).toBe("/api");
+  });
+
+  test("default auth base stays on the same origin", () => {
+    expect(resolveAuthApiBaseUrl({})).toBe("/api/auth");
+  });
+});
+
+describe("relative URL handling", () => {
+  test("joins a relative base without throwing", () => {
+    // Previously `new URL("/api/v1/auth/login")` threw
+    // "TypeError: Invalid URL" before the request was even attempted.
+    expect(joinUrl("/api", "/v1/auth/login")).toBe("/api/v1/auth/login");
+  });
+
+  test("joins an absolute base and tolerates slashes", () => {
+    expect(joinUrl("http://localhost:8080/", "v1/auth/login")).toBe(
+      "http://localhost:8080/v1/auth/login"
+    );
+  });
+});
+
+describe("relative-base requests", () => {
+  test("issues the request against a same-origin path", async () => {
+    const client = createApiClient("/api");
+    const fetchMock = jest
+      .spyOn(global, "fetch")
+      // jsdom does not expose the fetch Response constructor, so a minimal
+      // stand-in is used instead.
+      .mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({ ok: true }),
+      } as unknown as Response);
+
+    try {
+      await client.get("/v1/wallet/balance", { currency: "USD" });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/wallet/balance?currency=USD",
+        expect.objectContaining({ method: "GET" })
+      );
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 });
 

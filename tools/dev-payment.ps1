@@ -4,8 +4,11 @@
 
 $env:PAYMENT_ENVIRONMENT                    = "development"
 $env:PAYMENT_NOWPAYMENTS_BASE_URL           = "https://api.nowpayments.io/v1"
-$env:PAYMENT_NOWPAYMENTS_API_KEY            = "S9ABM14-ZRW4V20-HS8C1SY-84MBY5P"
-$env:PAYMENT_NOWPAYMENTS_IPN_SECRET         = "cpWmw0u7X4m2hO5HrnXbZVzc+vcgoFBI"
+# Секреты больше не хранятся в скрипте: задайте их в своей оболочке или в
+# локальном .env (файл в .gitignore). Скрипт не подставляет значения по
+# умолчанию специально, чтобы забытый экспорт был виден сразу.
+#   $env:PAYMENT_NOWPAYMENTS_API_KEY    = "..."
+#   $env:PAYMENT_NOWPAYMENTS_IPN_SECRET = "..."
 $env:PAYMENT_NOWPAYMENTS_IPN_CALLBACK_URL   = "http://localhost:8084/api/v1/payments/webhooks/nowpayments"
 
 $env:PAYMENT_DATABASE_HOST                  = "localhost"

@@ -238,11 +238,11 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           # Dockerfile.frontend does not exist in this repository; the Next.js
-          # image is infra/docker/Dockerfile.web, alongside .admin/.go/.python/
-          # .rust. It also expects the build context to be apps/web/ — it does
-          # `COPY package.json package-lock.json* ./` — so a repo-root context
-          # cannot build it either.
-          context: apps/web
+          # image is infra/docker/Dockerfile.web. That file copies
+          # apps/web/package*.json, so its build context is the repository root
+          # — the same context docker-compose.prod.yml uses. With context
+          # apps/web the COPY cannot resolve and the build fails immediately.
+          context: .
           file: infra/docker/Dockerfile.web
           push: ${{ github.event_name != 'pull_request' }}
           # On a pull request the image is not pushed, so Trivy could not find

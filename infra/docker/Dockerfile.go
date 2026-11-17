@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for Go services
-# Opus Casino - Auth, User, Payment, Bonus, Casino, Notification, KYC
+# Opus Casino - Auth, User, Payment, Bonus, Casino, Notification, KYC, Admin BFF
 #
 # The build context is the repository root, because every service module
 # carries
@@ -7,7 +7,14 @@
 # and that relative path only resolves if the module keeps its place under
 # services/go/. The tree is therefore mirrored into /src instead of being
 # flattened, and the build runs from the module's own directory.
-# SERVICE_PATH selects the module, exactly as ci-go.yml passes it.
+#
+# SERVICE_PATH selects the module. Callers must pass the same argument name:
+#   docker build -f infra/docker/Dockerfile.go \
+#     --build-arg SERVICE_PATH=services/go/user .
+#
+# NOTE: `SERVICE` is *not* an alias. Passing SERVICE (as docker-compose used to)
+# silently falls back to the default below and every image ends up being the
+# auth binary - the bug this header exists to prevent from coming back.
 
 # =============================================================================
 # Stage 1: Builder
@@ -34,8 +41,8 @@ ARG BUF_VERSION=1.73.0
 # SERVICE_PATH: module directory under services/go/ (default: auth)
 # CMD_PATH: main package path inside that module, module-relative. Left empty
 #   by default so the main package is discovered rather than assumed: it sits
-#   at the module root in auth, user, bonus, casino, notification and kyc, but
-#   under cmd/server in payment. `./.` there fails with "no Go files in /src".
+#   at the module root in auth, user, bonus, casino, notification, kyc and
+#   admin-bff, but under cmd/server in payment.
 # VERSION: stamped into the binary
 ARG SERVICE_PATH=services/go/auth
 ARG CMD_PATH=
@@ -43,28 +50,31 @@ ARG VERSION=dev
 
 WORKDIR /src
 
-# Resolve dependencies before the source is copied, so a source-only change
-# keeps the module cache layer warm.
+# Only the module manifests first, so a source-only change keeps the module
+# cache layer warm.
 #
 # The glob is deliberate: a module with no dependencies has no go.sum at all
 # (kyc is one), and naming the file explicitly aborts the build with
 #   failed to calculate checksum ... "/services/go/kyc/go.sum": not found
 # go.mod always matches, so the COPY still succeeds without it.
-COPY ${SERVICE_PATH}/go.* ./
-COPY libs/proto/go.mod libs/proto/go.sum libs/proto/
+COPY ${SERVICE_PATH}/go.* ${SERVICE_PATH}/
 
-# libs/proto/gen is gitignored, so a fresh checkout has no Go stubs and no
-# module that imports github.com/opus-casino/proto/gen/go can compile.
-# Generating them here is the same step CI - Go runs.
-RUN curl -fsSL -o /tmp/buf.tar.gz \
-        "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64.tar.gz" \
-    && tar -xzf /tmp/buf.tar.gz -C /tmp \
-    && install -m 0755 /tmp/buf/bin/buf /usr/local/bin/buf \
-    && buf --version
-
+# The Go stubs under libs/proto/gen/go are committed, so the normal path needs
+# no generator. They are regenerated only when a checkout is missing them
+# (e.g. a partial context), mirroring what CI - Go does in its `protos` job.
 COPY libs/proto/ libs/proto/
-RUN cd libs/proto && buf generate --template buf.gen.yaml --output gen/go \
-    && test -f gen/go/common/v1/money.pb.go
+
+RUN if [ ! -f libs/proto/gen/go/common/v1/money.pb.go ]; then \
+        curl -fsSL -o /tmp/buf.tar.gz \
+            "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64.tar.gz" \
+        && tar -xzf /tmp/buf.tar.gz -C /tmp \
+        && install -m 0755 /tmp/buf/bin/buf /usr/local/bin/buf \
+        && cd libs/proto \
+        && buf generate --template buf.gen.yaml --output gen/go \
+        && test -f gen/go/common/v1/money.pb.go; \
+    fi
+
+RUN cd ${SERVICE_PATH} && go mod download
 
 # Mirror the repository layout: services/go/<service> must stay three levels
 # below the root for ../../../libs/proto to resolve.
@@ -78,7 +88,6 @@ COPY ${SERVICE_PATH}/ ${SERVICE_PATH}/
 # the module root.
 RUN cd ${SERVICE_PATH} \
     && MAIN_PKG="${CMD_PATH}" \
-    && go mod download \
     && if [ -z "${MAIN_PKG}" ]; then \
            MAIN_PKG="$(go list -f '{{if eq .Name "main"}}{{.Dir}}{{end}}' ./... \
                | grep . \
@@ -92,35 +101,16 @@ RUN cd ${SERVICE_PATH} \
         -o /build/app \
         "${MAIN_PKG}"
 
-# =============================================================================
-# Stage 2: Runtime (distroless for security)
-# =============================================================================
-FROM gcr.io/distroless/static-debian12 AS runtime
-
-# Copy binary from builder
-COPY --from=builder /build/app /usr/local/bin/app
-
-# Copy CA certificates
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-
-# Copy timezone data
-COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
-
-# Set working directory
-WORKDIR /
-
-# Environment variables
-ENV APP_ENV=production
-ENV TZ=UTC
-
-# Expose default port
-EXPOSE 8080
-
-# Run the application
-ENTRYPOINT ["/usr/local/bin/app"]
+# The runtime stage MUST stay last: Docker builds the final stage unless
+# --target is passed, and every compose/CD build relies on the default. With
+# the debug stage at the end (as it was) production images ran APP_ENV=development,
+# as root, and tripped the services' own fail-fast checks - while looking
+# like a successful build.
 
 # =============================================================================
-# Stage 3: Debug (for development)
+# Stage 2: Debug (for development)
+#
+# Opt in explicitly: docker build --target debug ...
 # =============================================================================
 FROM alpine:3.22 AS debug
 
@@ -141,5 +131,34 @@ ENV APP_ENV=development
 ENV TZ=UTC
 
 EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/app"]
+
+# =============================================================================
+# Stage 3 (default): Runtime
+# =============================================================================
+# alpine instead of distroless: the container healthchecks in
+# infra/docker/docker-compose.*.yml run `curl` inside the image, and distroless
+# ships neither a shell nor an HTTP client - every service stayed "unhealthy"
+# forever. The image is still minimal, non-root and read-only friendly.
+FROM alpine:3.22 AS runtime
+
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    curl \
+ && addgroup -S -g 10001 app \
+ && adduser  -S -u 10001 -G app -H -s /sbin/nologin app
+
+COPY --from=builder /build/app /usr/local/bin/app
+
+WORKDIR /
+
+ENV APP_ENV=production
+ENV TZ=UTC
+
+EXPOSE 8080
+
+USER 10001:10001
 
 ENTRYPOINT ["/usr/local/bin/app"]

@@ -1,0 +1,43 @@
+# Keep Docker build contexts small. The Go/Rust/web/admin images are all built
+# from the repository root, so without this file every build uploaded
+# node_modules, .next, test fixtures and the skills directory.
+
+**/node_modules
+**/.next
+**/dist
+**/build
+**/coverage
+**/.turbo
+**/.cache
+**/*.tsbuildinfo
+
+# VCS / editor
+.git
+.gitignore
+.agents
+.claude
+.continue
+.factory
+.junie
+.kiro
+.openhands
+.qoder
+.qwen
+.trae
+.vibe
+.windsurf
+
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# Docs and tooling that no image needs
+docs
+tools
+infra/terraform
+infra/k8s
+infra/helm
+infra/argocd
+.arena

@@ -5,6 +5,9 @@ metadata:
   namespace: opus-casino
 data:
   RUST_LOG: "info"
+  # GO_ENV is not read by any Go service; APP_ENV is (it also gates the
+  # fail-fast config checks).
+  APP_ENV: "production"
   GO_ENV: "production"
   PYTHON_ENV: "production"
   
@@ -25,6 +28,21 @@ data:
   REDPANDA_BROKERS: "redpanda-0.redpanda.opus-casino.svc.cluster.local:9092"
   
   # gRPC endpoints
-  BETTING_ENGINE_GRPC: "betting-engine.opus-casino.svc.cluster.local:50051"
-  WALLET_CORE_GRPC: "wallet-core.opus-casino.svc.cluster.local:50051"
-  AUTH_GRPC: "auth.opus-casino.svc.cluster.local:50051"
+  #
+  # These names are the ones the Go services actually read
+  # (services/go/{casino,bonus}/internal/config + admin-bff). The previous
+  # AUTH_GRPC / WALLET_CORE_GRPC / BETTING_ENGINE_GRPC keys matched no call site,
+  # so every client silently fell back to localhost. Ports are the ones the
+  # Deployments bind: auth 50051, user 50052, payment 50055, casino 50057,
+  # bonus 50056, wallet-core 50053, betting-engine 9090.
+  AUTH_SERVICE_ADDR: "auth.opus-casino.svc.cluster.local:50051"
+  USER_SERVICE_ADDR: "user.opus-casino.svc.cluster.local:50052"
+  PAYMENT_SERVICE_ADDR: "payment.opus-casino.svc.cluster.local:50055"
+  WALLET_GRPC_ADDR: "wallet-core.opus-casino.svc.cluster.local:50053"
+  USER_GRPC_ADDR: "user.opus-casino.svc.cluster.local:50052"
+  BETTING_ENGINE_ADDR: "betting-engine.opus-casino.svc.cluster.local:9090"
+
+  # Config-rs key/value form used by the Rust services.
+  REDIS__HOST: "dragonfly.opus-casino.svc.cluster.local"
+  REDIS__PORT: "6379"
+  APP__REDPANDA_BROKERS: "redpanda-0.redpanda.opus-casino.svc.cluster.local:9092"

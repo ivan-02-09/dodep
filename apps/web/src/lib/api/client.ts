@@ -1,12 +1,27 @@
 import { useAuthStore } from "@/stores/auth-store";
 
-const DEFAULT_API_BASE = "http://localhost:8080";
-const DEFAULT_AUTH_API_BASE = "http://localhost:8083";
+// Relative by default: the browser talks to the same origin, and nginx (or the
+// Next.js server) proxies /api to the Go services. A hard-coded localhost here
+// means "the user's own machine" in production, not the backend host.
+const DEFAULT_API_BASE = "/api";
+const DEFAULT_AUTH_API_BASE = "/api/auth";
 
 type PublicEnv = Record<string, string | undefined>;
 
 export function resolveApiBaseUrl(env: PublicEnv = process.env): string {
   return env.NEXT_PUBLIC_API_URL || DEFAULT_API_BASE;
+}
+
+/**
+ * Joins a base URL (absolute or relative) with a path, tolerating a trailing
+ * slash on the base and a leading slash on the path. Returns a relative href
+ * when the base is relative, which is what the browser needs behind nginx.
+ */
+export function joinUrl(base: string, path: string): string {
+  if (!base) return path.startsWith("/") ? path : `/${path}`;
+  const trimmedBase = base.endsWith("/") ? base.slice(0, -1) : base;
+  const trimmedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${trimmedBase}${trimmedPath}`;
 }
 
 export function resolveAuthApiBaseUrl(env: PublicEnv = process.env): string {
@@ -104,12 +119,15 @@ class ApiClient {
       headers?: Record<string, string>;
     } = {}
   ): Promise<T> {
-    const url = new URL(`${this.baseUrl}${path}`);
+    // `new URL("/api/v1/...")` throws TypeError: Invalid URL, because the base
+    // is relative in production (NEXT_PUBLIC_API_URL=/api). Build the href by
+    // hand and never depend on window.location during SSR/static rendering.
+    const query = new URLSearchParams();
     if (options.params) {
-      Object.entries(options.params).forEach(([k, v]) =>
-        url.searchParams.set(k, v)
-      );
+      Object.entries(options.params).forEach(([k, v]) => query.set(k, v));
     }
+    const queryString = query.toString();
+    const href = `${joinUrl(this.baseUrl, path)}${queryString ? `?${queryString}` : ""}`;
 
     const { accessToken, refreshTokens, logout } =
       useAuthStore.getState();
@@ -121,7 +139,7 @@ class ApiClient {
       const startedAt = Date.now();
       let response: Response;
       try {
-        response = await fetch(url.toString(), {
+        response = await fetch(href, {
           method,
           headers: {
             "Content-Type": "application/json",
@@ -133,12 +151,12 @@ class ApiClient {
         });
       } catch (error) {
         const message =
-          `Network error while calling ${method} ${url.toString()}. ` +
+          `Network error while calling ${method} ${href}. ` +
           "Backend is unreachable or refused the connection.";
         console.error("[api] network_error", {
           requestId,
           method,
-          url: url.toString(),
+          url: href,
           elapsedMs: Date.now() - startedAt,
           error,
         });
@@ -147,7 +165,7 @@ class ApiClient {
           message,
           details: {
             method,
-            url: url.toString(),
+            url: href,
             elapsed_ms: Date.now() - startedAt,
           },
           request_id: requestId,
@@ -174,7 +192,9 @@ class ApiClient {
           return await makeRequest(token);
         } catch {
           logout();
-          window.location.href = "/login";
+          if (typeof window !== "undefined") {
+            window.location.href = "/login";
+          }
           throw new ApiClientError(401, {
             code: "AUTH_TOKEN_EXPIRED",
             message: "Session expired",

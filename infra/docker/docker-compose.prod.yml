@@ -30,16 +30,31 @@ services:
   # ================================================================
 
   postgres:
-    image: postgres:16-alpine
+    # The migrations require the Citus, pg_partman and pg_stat_statements
+    # extensions (libs/migrations/postgresql/001_extensions_and_enums.sql).
+    # The vanilla postgres image cannot CREATE EXTENSION citus, so the first
+    # initdb script aborted and the database was never provisioned.
+    image: citusdata/citus:12.1
     container_name: opus-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-opus_casino}
       POSTGRES_USER: ${POSTGRES_USER:-opus_app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Read by the initdb wrapper below.
+      MIGRATIONS_DIR: /opt/opus-migrations
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ../../libs/migrations/postgresql:/docker-entrypoint-initdb.d:ro
+      # NOT mounted into /docker-entrypoint-initdb.d: that directory is run
+      # verbatim, in C sort order, which executes 014_*.down.sql (DROP TABLE)
+      # before 014_*.sql. The wrapper applies up-migrations only, with
+      # ON_ERROR_STOP=1, and records them in schema_migrations.
+      - ../../libs/migrations/postgresql:/opt/opus-migrations:ro
+      # Executable on purpose: the entrypoint runs an *executable* .sh file,
+      # while a non-executable one is sourced into its own shell (where our
+      # `set -e` / `return` would leak into the entrypoint). The script keeps
+      # everything in a subshell for the same reason.
+      - ./postgres-migrate.sh:/docker-entrypoint-initdb.d/10-opus-migrate.sh:ro
     networks:
       - backend
     healthcheck:
@@ -243,14 +258,25 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.rust
       args:
-        SERVICE: wallet-core
+        SERVICE_NAME: wallet-core
+        PROFILE: release
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      GRPC_PORT: 50053
-      HTTP_PORT: 8081
-      KAFKA_BROKERS: ${KAFKA_BROKERS}
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      # wallet-core is config-rs based: every key is <PREFIX>__<FIELD>.
+      # DATABASE_URL / GRPC_PORT / HTTP_PORT were silently ignored, so the
+      # process tried postgres@localhost and bound HTTP on 0.0.0.0:3003 while
+      # nginx proxied wallet-core:8081.
+      DATABASE__HOST: postgres
+      DATABASE__PORT: 5432
+      DATABASE__DATABASE: ${POSTGRES_DB:-opus_casino}
+      DATABASE__USERNAME: ${POSTGRES_USER}
+      DATABASE__PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS__HOST: ${REDIS_HOST:-dragonfly}
+      REDIS__PORT: ${REDIS_PORT:-6379}
+      REDIS__PASSWORD: ${REDIS_PASSWORD}
+      GRPC__ADDR: 0.0.0.0:50053
+      # Port nginx proxies as wallet_upstream and the healthcheck probes.
+      HTTP__ADDR: 0.0.0.0:8081
+      TRACING__OTLP_ENDPOINT: http://jaeger:4317
       RUST_LOG: info
     depends_on:
       postgres:
@@ -258,7 +284,7 @@ services:
       dragonfly:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8081/health"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -272,15 +298,20 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.rust
       args:
-        SERVICE: betting-engine
+        SERVICE_NAME: betting-engine
+        PROFILE: release
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      GRPC_PORT: 50054
-      HTTP_PORT: 8080
-      KAFKA_BROKERS: ${KAFKA_BROKERS}
-      SPORTRADAR_API_KEY: ${SPORTRADAR_API_KEY}
-      SPORTRADAR_LIVE_ODDS_WS: ${SPORTRADAR_LIVE_ODDS_WS}
+      # AppConfig::load() only reads Environment::with_prefix("APP") with the
+      # "__" separator. DATABASE_URL was ignored, and app.database_url has no
+      # serde default, so the service aborted at startup.
+      APP__DATABASE_URL: ${DATABASE_URL}
+      APP__CACHE_URL: redis://:${REDIS_PASSWORD}@${REDIS_HOST:-dragonfly}:${REDIS_PORT:-6379}/0
+      APP__REDPANDA_BROKERS: ${KAFKA_BROKERS:-redpanda:9092}
+      APP__HTTP_PORT: 8080
+      APP__GRPC_PORT: 50054
+      APP__AUTH_ED25519_PUBLIC_KEY: ${JWT_ED25519_PUBLIC_KEY}
+      APP__SPORTRADAR_API_KEY: ${SPORTRADAR_API_KEY}
+      APP__SPORTRADAR_LIVE_ODDS_WS: ${SPORTRADAR_LIVE_ODDS_WS}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       RUST_LOG: info
     depends_on:
@@ -289,7 +320,7 @@ services:
       dragonfly:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8080/healthz"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -303,13 +334,18 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.rust
       args:
-        SERVICE: websocket-gateway
+        SERVICE_NAME: websocket-gateway
+        PROFILE: release
     environment:
-      REDIS_URL: ${REDIS_URL}
-      GRPC_PORT: 50062
-      HTTP_PORT: 8082
-      BETTING_ENGINE_ADDR: betting-engine:50054
-      KAFKA_BROKERS: ${KAFKA_BROKERS}
+      # Same APP__-only loader as betting-engine: redpanda_brokers and
+      # cache_url have no serde defaults, so HTTP_PORT/KAFKA_BROKERS alone left
+      # the gateway unable to start.
+      APP__CACHE_URL: redis://:${REDIS_PASSWORD}@${REDIS_HOST:-dragonfly}:${REDIS_PORT:-6379}/0
+      APP__REDPANDA_BROKERS: ${KAFKA_BROKERS:-redpanda:9092}
+      # Port nginx proxies as ws_upstream.
+      APP__HTTP_PORT: 8082
+      APP__MAX_CONNECTIONS: "100000"
+      CORS_ORIGINS: ${CORS_ORIGINS}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       RUST_LOG: info
     depends_on:
@@ -318,7 +354,7 @@ services:
       dragonfly:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8082/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8082/healthz"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -336,12 +372,16 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.go
       args:
-        SERVICE: auth
+        SERVICE_PATH: services/go/auth
+        VERSION: ${IMAGE_TAG:-dev}
     environment:
       PORT: 8083
       GRPC_PORT: 50051
       DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
+      # The Go binaries read REDIS_ADDR/REDIS_PASSWORD (REDIS_URL was passed
+      # and never parsed, so every service fell back to localhost).
+      REDIS_ADDR: ${REDIS_HOST:-dragonfly}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
       JWT_ED25519_PRIVATE_KEY: ${JWT_ED25519_PRIVATE_KEY}
       JWT_ED25519_PUBLIC_KEY: ${JWT_ED25519_PUBLIC_KEY}
       JWT_ACCESS_EXPIRY: ${JWT_ACCESS_EXPIRY:-900}
@@ -353,6 +393,15 @@ services:
       SMTP_PASSWORD: ${SMTP_PASSWORD}
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL}
       APP_BASE_URL: ${APP_BASE_URL}
+      WEB_APP_URL: ${APP_BASE_URL}
+      APP_ENV: ${APP_ENV:-production}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI}
+      # auth honours APP_ENV=development to skip its fail-fast JWT checks; in
+      # production neither this nor the Ed25519 keys may be empty.
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
@@ -360,7 +409,7 @@ services:
       dragonfly:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8083/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8083/health"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -374,18 +423,28 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.go
       args:
-        SERVICE: user
+        SERVICE_PATH: services/go/user
+        VERSION: ${IMAGE_TAG:-dev}
     environment:
       PORT: 8085
       GRPC_PORT: 50052
       DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
+      # The Go binaries read REDIS_ADDR/REDIS_PASSWORD (REDIS_URL was passed
+      # and never parsed, so every service fell back to localhost).
+      REDIS_ADDR: ${REDIS_HOST:-dragonfly}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
       AUTH_GRPC_ADDR: auth:50051
       SUMSUB_API_KEY: ${SUMSUB_API_KEY}
       SUMSUB_APP_TOKEN: ${SUMSUB_APP_TOKEN}
       SUMSUB_SECRET_KEY: ${SUMSUB_SECRET_KEY}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       GEO_BLOCKED_COUNTRIES: ${GEO_BLOCKED_COUNTRIES}
+      # config.Validate() fails the process outside APP_ENV=development unless
+      # one of these is usable; APP_ENV also decides whether it runs at all.
+      APP_ENV: ${APP_ENV:-production}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      JWT_ED25519_PUBLIC_KEY: ${JWT_ED25519_PUBLIC_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
@@ -393,7 +452,7 @@ services:
       auth:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8085/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8085/health"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -407,8 +466,9 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.go
       args:
-        SERVICE: payment
+        SERVICE_PATH: services/go/payment
         CMD_PATH: cmd/server
+        VERSION: ${IMAGE_TAG:-dev}
     environment:
       PAYMENT_SERVER_PORT: 8084
       PAYMENT_DATABASE_HOST: postgres
@@ -440,7 +500,7 @@ services:
       user:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8084/healthz"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8084/healthz"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -454,15 +514,22 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.go
       args:
-        SERVICE: casino
+        SERVICE_PATH: services/go/casino
+        VERSION: ${IMAGE_TAG:-dev}
     environment:
       PORT: 8086
       GRPC_PORT: 50057
       DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
+      # The Go binaries read REDIS_ADDR/REDIS_PASSWORD (REDIS_URL was passed
+      # and never parsed, so every service fell back to localhost).
+      # casino is the one Go service that composes REDIS_HOST + ":" +
+      # REDIS_PORT itself; REDIS_ADDR is ignored here.
+      REDIS_HOST: ${REDIS_HOST:-dragonfly}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
       WALLET_GRPC_ADDR: wallet-core:50053
       USER_GRPC_ADDR: user:50052
-      KAFKA_BROKERS: ${KAFKA_BROKERS}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-redpanda:9092}
       PRAGMATIC_ENABLED: ${PRAGMATIC_ENABLED:-false}
       PRAGMATIC_AGENT_ID: ${PRAGMATIC_AGENT_ID}
       PRAGMATIC_SECRET_KEY: ${PRAGMATIC_SECRET_KEY}
@@ -481,6 +548,15 @@ services:
       AMUSNET_SECRET_KEY: ${AMUSNET_SECRET_KEY}
       AMUSNET_API_URL: ${AMUSNET_API_URL}
       GEO_BLOCKED_COUNTRIES: ${GEO_BLOCKED_COUNTRIES}
+      APP_ENV: ${APP_ENV:-production}
+      JWT_ED25519_PUBLIC_KEY: ${JWT_ED25519_PUBLIC_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      # Signature replay window for provider callbacks (default 180s).
+      PRAGMATIC_REPLAY_WINDOW_SEC: ${PRAGMATIC_REPLAY_WINDOW_SEC:-180}
+      PGSOFT_REPLAY_WINDOW_SEC: ${PGSOFT_REPLAY_WINDOW_SEC:-180}
+      # mTLS material for Amusnet, mounted from the compose secrets below.
+      AMUSNET_CLIENT_CERT_PATH: /run/secrets/amusnet_client.crt
+      AMUSNET_CLIENT_KEY_PATH: /run/secrets/amusnet_client.key
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
@@ -492,7 +568,7 @@ services:
       user:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8086/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8086/health"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -506,18 +582,26 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.go
       args:
-        SERVICE: bonus
+        SERVICE_PATH: services/go/bonus
+        VERSION: ${IMAGE_TAG:-dev}
     environment:
       PORT: 8088
       GRPC_PORT: 50056
       DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
+      # The Go binaries read REDIS_ADDR/REDIS_PASSWORD (REDIS_URL was passed
+      # and never parsed, so every service fell back to localhost).
+      REDIS_ADDR: ${REDIS_HOST:-dragonfly}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
       WALLET_GRPC_ADDR: wallet-core:50053
       KAFKA_BROKERS: ${KAFKA_BROKERS}
       WELCOME_BONUS_PERCENTAGE: ${WELCOME_BONUS_PERCENTAGE:-100}
       WELCOME_BONUS_MAX_AMOUNT: ${WELCOME_BONUS_MAX_AMOUNT:-200}
       WELCOME_BONUS_WAGERING_REQUIREMENT: ${WELCOME_BONUS_WAGERING_REQUIREMENT:-30}
       WELCOME_BONUS_EXPIRY_DAYS: ${WELCOME_BONUS_EXPIRY_DAYS:-30}
+      APP_ENV: ${APP_ENV:-production}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      OTEL_SERVICE_NAME: bonus
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
@@ -525,7 +609,7 @@ services:
       wallet-core:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8088/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8088/health"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -539,13 +623,33 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.go
       args:
-        SERVICE: notification
+        SERVICE_PATH: services/go/notification
+        VERSION: ${IMAGE_TAG:-dev}
     environment:
       PORT: 8087
       GRPC_PORT: 50058
       DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      KAFKA_BROKERS: ${KAFKA_BROKERS}
+      # The Go binaries read REDIS_ADDR/REDIS_PASSWORD (REDIS_URL was passed
+      # and never parsed, so every service fell back to localhost).
+      REDIS_ADDR: ${REDIS_HOST:-dragonfly}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # notification subscribes to REDPANDA_BROKERS; KAFKA_BROKERS was passed
+      # and ignored, so the consumer silently pointed at localhost:9092.
+      REDPANDA_BROKERS: ${REDPANDA_BROKERS:-redpanda:9092}
+      REDPANDA_ENABLED: ${REDPANDA_ENABLED:-true}
+      # The delivery channels are configured through EMAIL_*/SMS_*/PUSH_*; the
+      # SMTP_* names below were never read by this service.
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-false}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-sendgrid}
+      EMAIL_FROM: ${EMAIL_FROM}
+      EMAIL_API_KEY: ${EMAIL_API_KEY}
+      EMAIL_API_SECRET: ${EMAIL_API_SECRET}
+      SMS_ENABLED: ${SMS_ENABLED:-false}
+      SMS_PROVIDER: ${SMS_PROVIDER:-twilio}
+      SMS_API_KEY: ${SMS_API_KEY}
+      SMS_API_SECRET: ${SMS_API_SECRET}
+      PUSH_ENABLED: ${PUSH_ENABLED:-false}
+      PUSH_FIREBASE_KEY: ${PUSH_FIREBASE_KEY}
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
       SMTP_USER: ${SMTP_USER}
@@ -553,6 +657,7 @@ services:
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL}
       SMTP_FROM_NAME: ${SMTP_FROM_NAME}
       APP_BASE_URL: ${APP_BASE_URL}
+      APP_ENV: ${APP_ENV:-production}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
       postgres:
@@ -560,7 +665,7 @@ services:
       redpanda:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8087/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8087/health"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -574,12 +679,16 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.go
       args:
-        SERVICE: kyc
+        SERVICE_PATH: services/go/kyc
+        VERSION: ${IMAGE_TAG:-dev}
     environment:
       PORT: 8089
       GRPC_PORT: 50059
       DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
+      # The Go binaries read REDIS_ADDR/REDIS_PASSWORD (REDIS_URL was passed
+      # and never parsed, so every service fell back to localhost).
+      REDIS_ADDR: ${REDIS_HOST:-dragonfly}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
       SUMSUB_API_KEY: ${SUMSUB_API_KEY}
       SUMSUB_APP_TOKEN: ${SUMSUB_APP_TOKEN}
       SUMSUB_SECRET_KEY: ${SUMSUB_SECRET_KEY}
@@ -590,7 +699,7 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8089/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8089/health"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -604,25 +713,50 @@ services:
       context: ../..
       dockerfile: infra/docker/Dockerfile.go
       args:
-        SERVICE: admin-bff
+        SERVICE_PATH: services/go/admin-bff
+        VERSION: ${IMAGE_TAG:-dev}
     environment:
-      PORT: 8091
+      # internal/config reads HTTP_PORT (PORT was ignored -> the service bound
+      # 8080 while nginx proxied 8091).
+      HTTP_PORT: 8091
       DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-      AUTH_GRPC_ADDR: auth:50051
-      USER_GRPC_ADDR: user:50052
-      WALLET_GRPC_ADDR: wallet-core:50053
-      PAYMENT_GRPC_ADDR: payment:50055
-      CASINO_GRPC_ADDR: casino:50057
+      # The Go binaries read REDIS_ADDR/REDIS_PASSWORD (REDIS_URL was passed
+      # and never parsed, so every service fell back to localhost).
+      REDIS_ADDR: ${REDIS_HOST:-dragonfly}:${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # internal/config reads *_SERVICE_ADDR; the *_GRPC_ADDR names were
+      # silently ignored and every client fell back to localhost.
+      AUTH_SERVICE_ADDR: auth:50051
+      USER_SERVICE_ADDR: user:50052
+      PAYMENT_SERVICE_ADDR: payment:50055
+      BETTING_ENGINE_ADDR: betting-engine:50054
+      # The BFF both signs (login) and verifies admin tokens; the middleware
+      # reads the base64 key pair, which is the same material auth uses, so an
+      # admin token stays valid across services. JWT_SECRET_KEY is only the
+      # dev-mode HMAC fallback and must not be the sole configured key.
+      JWT_ED25519_PRIVATE_KEY: ${JWT_ED25519_PRIVATE_KEY}
+      JWT_ED25519_PUBLIC_KEY: ${JWT_ED25519_PUBLIC_KEY}
       ADMIN_BFF_AUTH_ED25519_PUBLIC_KEY: ${JWT_ED25519_PUBLIC_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      APP_ENV: ${APP_ENV:-production}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
-      - auth
-      - user
-      - payment
-      - casino
+      # Long form, because `- auth` only waits for the container to exist. Each
+      # gRPC client is created with grpc.NewClient, which does not connect, so a
+      # dependency that is up but not yet serving makes every admin request fail
+      # at call time instead of at boot.
+      auth:
+        condition: service_healthy
+      user:
+        condition: service_healthy
+      payment:
+        condition: service_healthy
+      casino:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8091/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8091/health"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -636,8 +770,9 @@ services:
     container_name: opus-web
     image: opus-casino/web:${IMAGE_TAG:-latest}
     build:
-      context: ../../apps/web
-      dockerfile: ../../infra/docker/Dockerfile.web
+      # Repository root: the Dockerfile copies apps/web/* from this context.
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.web
       args:
         NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-/api}
         NEXT_PUBLIC_WS_URL: wss://${APP_DOMAIN}/ws
@@ -647,7 +782,7 @@ services:
     networks:
       - frontend
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:3000/api/health"]
       interval: 20s
       timeout: 5s
       retries: 10
@@ -662,16 +797,19 @@ services:
     container_name: opus-admin
     image: opus-casino/admin:${IMAGE_TAG:-latest}
     build:
-      context: ../../apps/admin
-      dockerfile: ../../infra/docker/Dockerfile.admin
+      # Repository root: the admin app depends on libs/shared/typescript via a
+      # file: link that lives outside apps/admin.
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.admin
       args:
-        VITE_API_URL: ${PUBLIC_API_URL:-/api}
+        # The admin SPA talks to the BFF through nginx at /admin-api/.
+        VITE_API_URL: ${ADMIN_API_URL:-/admin-api}
         VITE_APP_ENV: ${APP_ENV:-production}
     restart: unless-stopped
     networks:
       - frontend
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:80/"]
       interval: 20s
       timeout: 5s
       retries: 10

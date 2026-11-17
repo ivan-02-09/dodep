@@ -71,30 +71,66 @@ CREATE TRIGGER trg_audit_user_limits
 -- ============================================================
 -- CITUS SHARDING
 -- ============================================================
+--
+-- Guarded on purpose. `create_distributed_table` only exists when the Citus
+-- extension is installed AND the current database is coordinator-managed.
+-- A single-node Citus image (citusdata/citus) still needs the extension
+-- created and the node registered, and a plain PostgreSQL instance (the
+-- docker-compose dev stack, CI service containers, test databases) has no
+-- Citus at all. Unguarded, this file aborted the whole migration run at the
+-- first statement and left the schema half-created.
+--
+-- Sharding is a scale-out concern: it must not block a fresh install.
 
--- Distributed tables: shard by user_id for co-location
--- All user-related data on same shard = no network JOINs
+DO $$
+DECLARE
+    citus_available BOOLEAN;
+    t               TEXT;
+    distributed     TEXT[] := ARRAY[
+        'users', 'wallets', 'wallet_transactions', 'bets',
+        'bet_selections', 'user_preferences', 'user_limits'
+    ];
+    reference       TEXT[] := ARRAY[
+        'currencies', 'countries', 'sports', 'game_configs', 'house_accounts'
+    ];
+BEGIN
+    SELECT EXISTS (
+        SELECT 1 FROM pg_extension WHERE extname = 'citus'
+    ) INTO citus_available;
 
-SELECT create_distributed_table('users', 'id');
-SELECT create_distributed_table('wallets', 'user_id');
-SELECT create_distributed_table('wallet_transactions', 'user_id');
-SELECT create_distributed_table('bets', 'user_id');
-SELECT create_distributed_table('bet_selections', 'user_id');
-SELECT create_distributed_table('user_preferences', 'user_id');
-SELECT create_distributed_table('user_limits', 'user_id');
+    IF NOT citus_available THEN
+        RAISE NOTICE 'citus extension absent - skipping table distribution';
+        RETURN;
+    END IF;
 
--- Reference tables: replicated to ALL nodes (small, read-heavy)
-SELECT create_reference_table('currencies');
-SELECT create_reference_table('countries');
-SELECT create_reference_table('sports');
-SELECT create_reference_table('game_configs');
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_proc WHERE proname = 'create_distributed_table'
+    ) THEN
+        RAISE NOTICE 'create_distributed_table() absent - skipping table distribution';
+        RETURN;
+    END IF;
 
--- House accounts: reference table (one per cluster)
-SELECT create_reference_table('house_accounts');
+    FOREACH t IN ARRAY distributed LOOP
+        IF to_regclass(t) IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = to_regclass(t))
+        THEN
+            -- Distributed by user_id for co-location; `users` is keyed by id.
+            PERFORM create_distributed_table(
+                t,
+                CASE WHEN t = 'users' THEN 'id' ELSE 'user_id' END
+            );
+        END IF;
+    END LOOP;
 
--- Audit log: distributed by entity_id for locality
--- (not by user_id since system events may not have user_id)
--- Keep as local for now — can distribute later if needed
+    FOREACH t IN ARRAY reference LOOP
+        IF to_regclass(t) IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = to_regclass(t))
+        THEN
+            PERFORM create_reference_table(t);
+        END IF;
+    END LOOP;
+END
+$$;
 
 -- ============================================================
 -- HELPER: set current user for RLS

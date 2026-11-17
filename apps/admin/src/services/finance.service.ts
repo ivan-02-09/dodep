@@ -35,19 +35,24 @@ export const financeService = {
     return response.data;
   },
 
+  // The withdrawal queue is served by handlers/withdrawals.go under
+  // /admin/withdrawals — not /admin/finance/withdrawals, which only exposes the
+  // read-only projection coming from the payment gRPC service. The old paths
+  // answered 404 (approve/reject) or 405, so the queue buttons did nothing.
   async getWithdrawal(withdrawalId: string): Promise<Withdrawal> {
     const response = await apiClient.get<ApiResponse<Withdrawal>>(
-      `/admin/finance/withdrawals/${withdrawalId}`,
+      `/admin/withdrawals/${withdrawalId}`,
     );
     return response.data.data;
   },
 
   async approveWithdrawal(withdrawalId: string): Promise<void> {
-    await apiClient.post(`/admin/finance/withdrawals/${withdrawalId}/approve`);
+    await apiClient.post(`/admin/withdrawals/${withdrawalId}/approve`);
   },
 
   async rejectWithdrawal(withdrawalId: string, reason: string): Promise<void> {
-    await apiClient.post(`/admin/finance/withdrawals/${withdrawalId}/reject`, {
+    // The BFF route is /decline and reads {"reason": "..."}.
+    await apiClient.post(`/admin/withdrawals/${withdrawalId}/decline`, {
       reason,
     });
   },
@@ -71,7 +76,9 @@ export const financeService = {
       type: "credit" | "debit";
     },
   ): Promise<void> {
-    await apiClient.post(`/admin/finance/users/${userId}/adjust-balance`, data);
+    // Balance adjustments live under /admin/players/:id/adjust-balance; the
+    // /admin/finance/users/... path never existed.
+    await apiClient.post(`/admin/players/${userId}/adjust-balance`, data);
   },
 
   async getFinancialSummary(params?: {

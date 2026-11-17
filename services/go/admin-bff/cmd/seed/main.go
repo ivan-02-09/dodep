@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
@@ -9,6 +11,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// minSeedPasswordLength is the shortest password the seed will accept. The old
+// default was "admin123" for a super_admin account: a published credential that
+// anyone could use on any deployment that ran the seed and forgot to override
+// ADMIN_PASSWORD.
+const minSeedPasswordLength = 12
 
 func main() {
 	dsn := os.Getenv("DATABASE_URL")
@@ -20,8 +28,22 @@ func main() {
 		email = "admin@example.com"
 	}
 	password := os.Getenv("ADMIN_PASSWORD")
-	if password == "" {
-		password = "admin123"
+	if len(password) < minSeedPasswordLength {
+		if password != "" {
+			log.Fatalf("ADMIN_PASSWORD must be at least %d characters", minSeedPasswordLength)
+		}
+		// Generate instead of falling back to a known value. Printed once so an
+		// operator can record it and change it at first login.
+		generated := make([]byte, 24)
+		if _, err := rand.Read(generated); err != nil {
+			log.Fatalf("generate password: %v", err)
+		}
+		password = base64.RawURLEncoding.EncodeToString(generated)
+		fmt.Printf("ADMIN_PASSWORD was not set; generated one-time password: %s\n", password)
+		fmt.Println("Store it now and change it after the first login.")
+	}
+	if email == "admin@example.com" {
+		log.Println("WARNING: ADMIN_EMAIL is the placeholder admin@example.com; set a real address")
 	}
 
 	db, err := pgxpool.New(context.Background(), dsn)

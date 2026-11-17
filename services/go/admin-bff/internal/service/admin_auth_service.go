@@ -74,6 +74,16 @@ func NewAdminAuthService(db *gorm.DB, jwtSecret string) *AdminAuthService {
 			svc.ed25519Pub = pub
 		}
 	}
+	// JWT_ED25519_PRIVATE_KEY (base64) is the form the auth service, the
+	// deployment templates and tools/gen-ed25519.go all use. Without it the BFF
+	// signed HS256 tokens while every other service verified EdDSA, so an admin
+	// session could not be used against any service but this one.
+	if svc.ed25519Priv == nil {
+		if priv := loadEd25519PrivateKeyBase64(os.Getenv("JWT_ED25519_PRIVATE_KEY")); priv != nil {
+			svc.ed25519Priv = priv
+			svc.ed25519Pub = priv.Public().(ed25519.PublicKey)
+		}
+	}
 	return svc
 }
 
@@ -90,6 +100,28 @@ func GenerateEd25519KeyFiles(privPath, pubPath string) error {
 	}
 	pubBlock := &pem.Block{Type: "PUBLIC KEY", Bytes: pub}
 	return os.WriteFile(pubPath, pem.EncodeToMemory(pubBlock), 0644)
+}
+
+// loadEd25519PrivateKeyBase64 decodes a base64 Ed25519 private key, accepting
+// the 64-byte seed+public form used by crypto/ed25519 key generation as well as
+// a 32-byte seed. Returns nil when the value is absent or unusable.
+func loadEd25519PrivateKeyBase64(encoded string) ed25519.PrivateKey {
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" {
+		return nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil
+	}
+	switch len(raw) {
+	case ed25519.PrivateKeySize:
+		return ed25519.PrivateKey(raw)
+	case ed25519.SeedSize:
+		return ed25519.NewKeyFromSeed(raw)
+	default:
+		return nil
+	}
 }
 
 func loadEd25519Keys(privPath string) (ed25519.PrivateKey, ed25519.PublicKey, error) {
