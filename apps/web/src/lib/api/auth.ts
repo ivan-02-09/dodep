@@ -57,7 +57,13 @@ export interface User {
   country_code: string;
   currency_code: string;
   kyc_level: number;
-  status: "pending" | "active" | "blocked" | "suspended" | "self_excluded" | "closed";
+  status:
+    | "pending"
+    | "active"
+    | "blocked"
+    | "suspended"
+    | "self_excluded"
+    | "closed";
   created_at: string;
   updated_at: string;
   last_login_at?: string;
@@ -74,8 +80,13 @@ export const authApi = {
 
   me: () => authApiClient.get<User>("/api/v1/auth/me"),
 
-  refresh: (refreshToken: string) =>
-    authApiClient.post<TokenPair>("/api/v1/auth/refresh", { refresh_token: refreshToken }),
+  // `refreshToken` is optional: browser sessions keep it in an HttpOnly cookie,
+  // which the server reads when the body is empty.
+  refresh: (refreshToken?: string) =>
+    authApiClient.post<TokenPair>(
+      "/api/v1/auth/refresh",
+      refreshToken ? { refresh_token: refreshToken } : {},
+    ),
 
   getGoogleStartUrl: () =>
     `${resolveAuthApiBaseUrl()}/api/v1/auth/google/start`,

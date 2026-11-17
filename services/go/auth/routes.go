@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -20,7 +19,13 @@ func setupRoutes(app *fiber.App, authService *service.AuthService) {
 
 	// ===== PUBLIC routes (no auth required) =====
 	auth := api.Group("/auth")
-	auth.Post("/register", func(c *fiber.Ctx) error {
+	// Register, login and refresh are stateful mutations: a client that retries
+	// after a dropped connection must not create two sessions, or rotate the
+	// refresh token twice — the second rotation looks like token reuse and
+	// revokes the whole token family.
+	idempotent := auth.Group("", IdempotencyMiddleware())
+
+	idempotent.Post("/register", func(c *fiber.Ctx) error {
 		requestID := getOrCreateRequestID(c)
 		startedAt := time.Now()
 		var req struct {
@@ -91,10 +96,16 @@ func setupRoutes(app *fiber.App, authService *service.AuthService) {
 			zap.Int64("duration_ms", time.Since(startedAt).Milliseconds()),
 		)
 
+		// Browser sessions live in HttpOnly cookies; the JSON body keeps the
+		// tokens for native clients that cannot use cookies.
+		if result.Tokens != nil {
+			accessTTL, refreshTTL := tokenTTLs(result.Tokens)
+			setSessionCookies(c, result.Tokens.AccessToken, result.Tokens.RefreshToken, accessTTL, refreshTTL)
+		}
 		return c.Status(201).JSON(result)
 	})
 
-	auth.Post("/login", func(c *fiber.Ctx) error {
+	idempotent.Post("/login", func(c *fiber.Ctx) error {
 		var req struct {
 			Identifier string  `json:"identifier"`
 			Username   string  `json:"username"`
@@ -144,17 +155,31 @@ func setupRoutes(app *fiber.App, authService *service.AuthService) {
 			return writeAPIError(c, status, code, message, nil)
 		}
 
+		if result.Tokens != nil {
+			accessTTL, refreshTTL := tokenTTLs(result.Tokens)
+			setSessionCookies(c, result.Tokens.AccessToken, result.Tokens.RefreshToken, accessTTL, refreshTTL)
+		}
 		return c.JSON(result)
 	})
 
-	auth.Post("/refresh", func(c *fiber.Ctx) error {
+	idempotent.Post("/refresh", func(c *fiber.Ctx) error {
 		var req struct {
 			RefreshToken string `json:"refresh_token"`
 			DeviceID     string `json:"device_id"`
 		}
 
-		if err := c.BodyParser(&req); err != nil {
-			return writeAPIError(c, fiber.StatusBadRequest, "AUTH_INVALID_REQUEST", "invalid request body", nil)
+		// The body is optional for browser clients: the refresh token travels in
+		// an HttpOnly cookie, so JavaScript never sees it.
+		if len(c.Body()) > 0 {
+			if err := c.BodyParser(&req); err != nil {
+				return writeAPIError(c, fiber.StatusBadRequest, "AUTH_INVALID_REQUEST", "invalid request body", nil)
+			}
+		}
+		if req.RefreshToken == "" {
+			req.RefreshToken = c.Cookies(RefreshCookieName)
+		}
+		if req.RefreshToken == "" {
+			return writeAPIError(c, fiber.StatusUnauthorized, "AUTH_MISSING_TOKEN", "missing refresh token", nil)
 		}
 
 		tokens, err := authService.RefreshTokens(c.Context(), req.RefreshToken, req.DeviceID)
@@ -163,6 +188,8 @@ func setupRoutes(app *fiber.App, authService *service.AuthService) {
 			return writeAPIError(c, status, code, message, nil)
 		}
 
+		accessTTL, refreshTTL := tokenTTLs(tokens)
+		setSessionCookies(c, tokens.AccessToken, tokens.RefreshToken, accessTTL, refreshTTL)
 		return c.JSON(tokens)
 	})
 
@@ -196,12 +223,14 @@ func setupRoutes(app *fiber.App, authService *service.AuthService) {
 			return c.Redirect(authService.WebRedirectURL()+"/login?"+q.Encode(), fiber.StatusTemporaryRedirect)
 		}
 
+		// Tokens are delivered as HttpOnly cookies on this response, not as query
+		// parameters: query strings end up in browser history, Referer headers and
+		// access logs, so a token placed there leaks the session to anything that
+		// can read those. The browser attaches the cookie to the follow-up call.
+		accessTTL, refreshTTL := tokenTTLs(result.Tokens)
+		setSessionCookies(c, result.Tokens.AccessToken, result.Tokens.RefreshToken, accessTTL, refreshTTL)
+
 		q := url.Values{}
-		q.Set("access_token", result.Tokens.AccessToken)
-		q.Set("refresh_token", result.Tokens.RefreshToken)
-		q.Set("expires_in", fmt.Sprintf("%d", result.Tokens.ExpiresIn))
-		q.Set("refresh_expires_in", fmt.Sprintf("%d", result.Tokens.RefreshExpiresIn))
-		q.Set("token_type", result.Tokens.TokenType)
 		q.Set("user_id", result.UserID)
 
 		return c.Redirect(authService.WebRedirectURL()+"/auth/google/callback?"+q.Encode(), fiber.StatusTemporaryRedirect)
@@ -245,6 +274,10 @@ func setupRoutes(app *fiber.App, authService *service.AuthService) {
 	protected.Post("/logout", func(c *fiber.Ctx) error {
 		userID := getUserID(c)
 		sessionID := getSessionID(c)
+
+		// Clear the cookies even if revoking the session fails: leaving a usable
+		// refresh cookie in the browser after "logout" is the worse outcome.
+		clearSessionCookies(c)
 
 		if err := authService.Logout(c.Context(), userID, sessionID); err != nil {
 			status, code, message := mapAuthError(err)

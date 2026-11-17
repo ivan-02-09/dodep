@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from "react";
+import { useAuthStore } from "@/stores/auth-store";
 
 interface WsMessage {
   type: string;
@@ -22,19 +23,32 @@ class WebSocketManager {
   private url: string;
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private token: string | null = null;
+  /** True while the socket is expected to stay connected. */
+  private shouldReconnect = false;
 
   constructor(options: WsClientOptions = {}) {
-    this.url = options.url || process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8080";
+    this.url = normalizeWsUrl(options.url || process.env.NEXT_PUBLIC_WS_URL);
     this.reconnectDelay = options.reconnectDelay || 1000;
     this.maxReconnectAttempts = options.maxReconnectAttempts || 10;
   }
 
-  connect(token: string) {
+  /**
+   * Open the socket.
+   *
+   * `token` is optional: a browser session authenticates with its HttpOnly
+   * cookie, which the browser attaches to the handshake automatically. Passing a
+   * token in the query string keeps native clients working, but it must never be
+   * the only path — the cookie is unreadable from JavaScript by design.
+   */
+  connect(token?: string) {
     if (this.ws?.readyState === WebSocket.OPEN) return;
 
-    this.token = token;
+    this.token = token ?? null;
+    this.shouldReconnect = true;
     const wsUrl = new URL(this.url);
-    wsUrl.searchParams.set("token", token);
+    if (token) {
+      wsUrl.searchParams.set("token", token);
+    }
 
     this.ws = new WebSocket(wsUrl.toString());
 
@@ -69,7 +83,10 @@ class WebSocketManager {
     };
   }
 
-  subscribe<T = unknown>(channel: string, handler: (data: T) => void): () => void {
+  subscribe<T = unknown>(
+    channel: string,
+    handler: (data: T) => void,
+  ): () => void {
     if (!this.subscriptions.has(channel)) {
       this.subscriptions.set(channel, new Set());
       if (this.ws?.readyState === WebSocket.OPEN) {
@@ -113,29 +130,56 @@ class WebSocketManager {
   }
 
   private tryReconnect() {
-    if (!this.token) return;
+    // The token is optional (browser sessions rely on the HttpOnly cookie), so
+    // reconnection must not be gated on it — otherwise a cookie-authenticated
+    // socket never comes back after a network blip.
+    if (!this.shouldReconnect) return;
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.error("Max WebSocket reconnection attempts reached");
       return;
     }
 
-    const delay = Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts), 30000);
+    const delay = Math.min(
+      this.reconnectDelay * Math.pow(2, this.reconnectAttempts),
+      30000,
+    );
     this.reconnectAttempts++;
 
     setTimeout(() => {
-      if (this.token) {
-        this.connect(this.token);
+      if (this.shouldReconnect) {
+        this.connect(this.token ?? undefined);
       }
     }, delay);
   }
 
   disconnect() {
+    this.shouldReconnect = false;
     this.stopHeartbeat();
     this.ws?.close();
     this.ws = null;
     this.subscriptions.clear();
     this.token = null;
   }
+}
+
+/**
+ * Resolve the WebSocket endpoint to an absolute ws:// or wss:// URL.
+ *
+ * `NEXT_PUBLIC_WS_URL` is built as a path in the Docker image (`/ws`) and as a
+ * full URL in docker-compose. `new WebSocket("/ws")` throws in the browser, so a
+ * relative value is expanded against the current origin here instead of failing
+ * at runtime. Port 8080 remains the local development default.
+ */
+export function normalizeWsUrl(raw?: string): string {
+  const candidate = (raw || "").trim();
+  if (candidate.startsWith("ws://") || candidate.startsWith("wss://")) {
+    return candidate;
+  }
+  if (candidate.startsWith("/") && typeof window !== "undefined") {
+    const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${scheme}//${window.location.host}${candidate}`;
+  }
+  return "ws://localhost:8080";
 }
 
 // Singleton instance
@@ -154,7 +198,7 @@ export function getWebSocketManager(): WebSocketManager {
 export function useWebSocket<T = unknown>(
   channel: string,
   onMessage: (data: T) => void,
-  enabled: boolean = true
+  enabled: boolean = true,
 ) {
   const wsRef = useRef<WebSocketManager | null>(null);
   const unsubscribeRef = useRef<(() => void) | null>(null);
@@ -165,15 +209,13 @@ export function useWebSocket<T = unknown>(
     wsRef.current = getWebSocketManager();
     const ws = wsRef.current;
 
-    // Get token from auth store
-    const token = document.cookie
-      .split("; ")
-      .find((row) => row.startsWith("auth_token="))
-      ?.split("=")[1];
-
-    if (token) {
-      ws.connect(token);
-    }
+    // Browser sessions authenticate with the HttpOnly `access_token` cookie,
+    // which the browser attaches to the WebSocket handshake on its own (the
+    // cookie is not readable from JavaScript). A token is only forwarded when a
+    // native client holds one explicitly — the old `document.cookie` lookup for
+    // "auth_token" read a cookie nobody ever set, so subscriptions silently
+    // never connected.
+    ws.connect(useAuthStore.getState().accessToken ?? undefined);
 
     unsubscribeRef.current = ws.subscribe<T>(channel, onMessage);
 

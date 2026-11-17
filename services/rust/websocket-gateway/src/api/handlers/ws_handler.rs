@@ -3,12 +3,14 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
+use crate::auth::{token_from_handshake, TokenError, TokenVerifier};
 use crate::domain::channel::{parse_topic, ClientMessage, ServerMessage, Topic, TopicResponse};
 use crate::state::AppState;
 
@@ -29,26 +31,43 @@ pub struct WsConnectParams {
 pub async fn ws_handler(
     ws: Option<WebSocketUpgrade>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     params: Option<Query<WsConnectParams>>,
 ) -> Response {
-    // Validate token before upgrade
-    // In production: call Auth Service gRPC or validate JWT locally
-    // For now: simple token presence check
-    let token = params.and_then(|Query(p)| p.token);
-    let token = match token.as_deref() {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            return (axum::http::StatusCode::UNAUTHORIZED, "Missing token").into_response();
+    // Authenticate before anything else: the user id decides which private
+    // topics (`user_bets:<id>`, `user_balance:<id>`) the socket may see.
+    let query_token = params.and_then(|Query(p)| p.token);
+    let token = match token_from_handshake(&headers, query_token.as_deref()) {
+        Some(token) => token,
+        None => return (StatusCode::UNAUTHORIZED, "Missing access token").into_response(),
+    };
+
+    let verifier = match TokenVerifier::from_base64(&state.config().auth_ed25519_public_key) {
+        Ok(verifier) => verifier,
+        Err(err) => {
+            // Fail closed: an unconfigured key must not mean "trust everyone".
+            tracing::error!(
+                error = %err,
+                "websocket handshake rejected: token verification unavailable"
+            );
+            return (StatusCode::SERVICE_UNAVAILABLE, "Authentication unavailable").into_response();
         }
     };
 
-    // Extract user_id from token (placeholder — in production decode JWT)
-    // Format: "user_{id}" for testing, or actual JWT decode
-    let user_id = extract_user_id(token);
+    let user_id = match verifier.verify(&token) {
+        Ok(user) => user.user_id,
+        Err(TokenError::Missing) => {
+            return (StatusCode::UNAUTHORIZED, "Missing access token").into_response()
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "websocket handshake rejected: invalid token");
+            return (StatusCode::UNAUTHORIZED, "Invalid access token").into_response();
+        }
+    };
 
     let Some(ws) = ws else {
         return (
-            axum::http::StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
             "Not a WebSocket upgrade request",
         )
             .into_response();
@@ -69,15 +88,6 @@ pub async fn ws_handler(
     }
 
     ws.on_upgrade(move |socket| handle_connection(socket, state, user_id))
-}
-
-fn extract_user_id(token: &str) -> i64 {
-    // Placeholder: parse "user_123" format
-    // Production: decode JWT Ed25519, extract sub claim
-    token
-        .strip_prefix("user_")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
 }
 
 async fn handle_connection(socket: WebSocket, state: AppState, user_id: i64) {

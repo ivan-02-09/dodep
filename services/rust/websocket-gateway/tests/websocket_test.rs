@@ -12,6 +12,10 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use base64::Engine as _;
+use jwt_simple::algorithms::{Ed25519KeyPair, EdDSAKeyPairLike};
+use jwt_simple::prelude::Duration as JwtDuration;
+use tokio_tungstenite::tungstenite;
 use futures::{SinkExt, StreamExt};
 use tower::ServiceExt;
 use websocket_gateway::api;
@@ -27,28 +31,56 @@ use websocket_gateway::state::AppState;
 /// connection is attempted while these tests run.
 const TEST_BROKERS: &str = "127.0.0.1:1";
 
-fn test_config() -> AppConfig {
+/// Test key the gateway verifies handshake tokens against.
+fn test_key_pair() -> Ed25519KeyPair {
+    Ed25519KeyPair::generate()
+}
+
+fn public_key_b64(pair: &Ed25519KeyPair) -> String {
+    base64::engine::general_purpose::STANDARD.encode(pair.public_key().to_bytes())
+}
+
+/// Sign an access token the way the Go auth service does: `iss`, `sub` and a
+/// `token_type` custom claim.
+fn access_token(pair: &Ed25519KeyPair, user_id: &str) -> String {
+    let claims = jwt_simple::claims::Claims::with_custom_claims(
+        serde_json::json!({ "token_type": "access" }),
+        JwtDuration::from_secs(900),
+    )
+    .with_issuer("opus-casino-auth")
+    .with_subject(user_id);
+    pair.sign(claims).expect("test token signs")
+}
+
+fn test_config(public_key: &str) -> AppConfig {
     AppConfig {
         service_name: "websocket-gateway-test".into(),
         http_port: 0,
         redpanda_brokers: TEST_BROKERS.into(),
         cache_url: "redis://127.0.0.1:1".into(),
+        auth_ed25519_public_key: public_key.to_string(),
         max_connections: 2,
         channel_buffer_size: 8,
         max_subscriptions_per_connection: 3,
     }
 }
 
-fn test_app() -> axum::Router {
-    let config = test_config();
+fn test_app_with(public_key: &str) -> axum::Router {
+    let config = test_config(public_key);
     let broadcaster = KafkaBroadcaster::new(&config.redpanda_brokers)
         .expect("KafkaBroadcaster::new must not require a live broker");
     api::build(AppState::new(config, broadcaster))
 }
 
+/// Router configured with a freshly generated verification key.
+fn test_app() -> (axum::Router, Ed25519KeyPair) {
+    let pair = test_key_pair();
+    (test_app_with(&public_key_b64(&pair)), pair)
+}
+
 #[tokio::test]
 async fn health_endpoints_return_ok() {
-    let app = test_app();
+    let (app, _key) = test_app();
 
     for path in ["/healthz", "/readyz"] {
         let response = app
@@ -72,7 +104,7 @@ async fn health_endpoints_return_ok() {
 
 #[tokio::test]
 async fn ws_upgrade_requires_token() {
-    let app = test_app();
+    let (app, _key) = test_app();
 
     // Missing and empty tokens are both refused with 401 by the auth gate,
     // before any upgrade happens.
@@ -117,8 +149,9 @@ async fn serve(app: axum::Router) -> std::net::SocketAddr {
 
 #[tokio::test]
 async fn ws_upgrade_with_token_is_accepted_and_echoes_ping() {
-    let addr = serve(test_app()).await;
-    let url = format!("ws://{addr}/ws?token=user_7");
+    let (app, key) = test_app();
+    let addr = serve(app).await;
+    let url = format!("ws://{addr}/ws?token={}", access_token(&key, "7"));
 
     let (mut socket, response) = tokio_tungstenite::connect_async(&url)
         .await
@@ -153,7 +186,8 @@ async fn ws_upgrade_with_token_is_accepted_and_echoes_ping() {
 
 #[tokio::test]
 async fn ws_upgrade_without_token_is_refused() {
-    let addr = serve(test_app()).await;
+    let (app, _key) = test_app();
+    let addr = serve(app).await;
     let url = format!("ws://{addr}/ws?token=");
     let status = handshake_status(&url)
         .await
@@ -181,19 +215,21 @@ async fn handshake_status(url: &str) -> Option<StatusCode> {
 
 #[tokio::test]
 async fn ws_connection_limit_is_enforced() {
-    let addr = serve(test_app()).await; // test_config() sets max_connections = 2
+    let (app, key) = test_app();
+    let addr = serve(app).await; // test_config() sets max_connections = 2
+    let token = access_token(&key, "1");
 
     let mut sockets = Vec::new();
     for _ in 0..2 {
         let (socket, response) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token=user_1"))
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={token}"))
                 .await
                 .expect("the first two connections are accepted");
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
         sockets.push(socket);
     }
 
-    let status = handshake_status(&format!("ws://{addr}/ws?token=user_1"))
+    let status = handshake_status(&format!("ws://{addr}/ws?token={token}"))
         .await
         .expect("server sent an HTTP response");
     assert_eq!(
@@ -209,7 +245,7 @@ async fn ws_connection_limit_is_enforced() {
 
 #[tokio::test]
 async fn unknown_route_is_not_found() {
-    let app = test_app();
+    let (app, _key) = test_app();
     let response = app
         .oneshot(
             Request::builder()
@@ -221,6 +257,89 @@ async fn unknown_route_is_not_found() {
         .expect("router responds");
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+
+#[tokio::test]
+async fn ws_upgrade_with_forged_token_is_refused() {
+    // The old handler accepted `?token=user_<id>` verbatim, so anyone could
+    // subscribe to another user's private topics. Strings of that shape must now
+    // fail signature verification.
+    let (app, _key) = test_app();
+    let addr = serve(app).await;
+
+    let status = handshake_status(&format!("ws://{addr}/ws?token=user_7"))
+        .await
+        .expect("server sent an HTTP response");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a token without a valid signature must be refused"
+    );
+}
+
+#[tokio::test]
+async fn ws_upgrade_with_token_signed_by_another_key_is_refused() {
+    let (app, _key) = test_app();
+    let addr = serve(app).await;
+    let attacker = test_key_pair();
+    let forged = access_token(&attacker, "7");
+
+    let status = handshake_status(&format!("ws://{addr}/ws?token={forged}"))
+        .await
+        .expect("server sent an HTTP response");
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a token signed by an unknown key must be refused"
+    );
+}
+
+#[tokio::test]
+async fn ws_upgrade_without_a_configured_key_fails_closed() {
+    // No verification key configured must mean 503, never "trust the client".
+    let app = test_app_with("");
+    let addr = serve(app).await;
+    let key = test_key_pair();
+    let token = access_token(&key, "7");
+
+    let status = handshake_status(&format!("ws://{addr}/ws?token={token}"))
+        .await
+        .expect("server sent an HTTP response");
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unconfigured verification key must refuse handshakes"
+    );
+}
+
+#[tokio::test]
+async fn ws_upgrade_accepts_the_session_cookie() {
+    // Browsers cannot set an Authorization header on a WebSocket handshake, so
+    // the HttpOnly access_token cookie is the path the web app actually uses.
+    let (app, key) = test_app();
+    let addr = serve(app).await;
+    let token = access_token(&key, "7");
+
+    let request = tungstenite::handshake::client::Request::builder()
+        .uri(format!("ws://{addr}/ws"))
+        .header("Host", addr.to_string())
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header(
+            "Sec-WebSocket-Key",
+            tungstenite::handshake::client::generate_key(),
+        )
+        .header("Cookie", format!("access_token={token}"))
+        .body(())
+        .expect("handshake request builds");
+
+    let (mut socket, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("handshake with a session cookie must succeed");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    let _ = socket.close(None).await;
 }
 
 #[test]

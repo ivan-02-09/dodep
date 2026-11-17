@@ -146,12 +146,8 @@ export const useAuthStore = create<AuthState>()(
   },
 
   fetchUser: async () => {
-    const { accessToken } = get();
-    if (!accessToken) {
-      set({ isAuthenticated: false });
-      return;
-    }
-
+    // The session lives in an HttpOnly cookie, so an empty in-memory token does
+    // not mean "logged out" — ask the API instead.
     set({ isLoading: true });
     try {
       const user = await authApi.me();
@@ -171,12 +167,11 @@ export const useAuthStore = create<AuthState>()(
 
   refreshTokens: async () => {
     const { refreshToken } = get();
-    if (!refreshToken) {
-      throw new Error("No refresh token");
-    }
 
     try {
-      const tokens = await authApi.refresh(refreshToken);
+      // `refreshToken` may be null: the refresh endpoint reads the HttpOnly
+      // cookie when the body carries no token.
+      const tokens = await authApi.refresh(refreshToken ?? undefined);
       set({
         accessToken: tokens.access_token,
         refreshToken: tokens.refresh_token,
@@ -195,9 +190,11 @@ export const useAuthStore = create<AuthState>()(
     }),
     {
       name: "auth-storage",
+      // Tokens are delivered as HttpOnly cookies and must never be written to
+      // localStorage: a single XSS could read them and keep the session alive.
+      // Only the "was authenticated" flag is remembered, and it is re-validated
+      // against the API by `fetchUser` on mount.
       partialize: (state) => ({
-        accessToken: state.accessToken,
-        refreshToken: state.refreshToken,
         isAuthenticated: state.isAuthenticated,
       }),
     }

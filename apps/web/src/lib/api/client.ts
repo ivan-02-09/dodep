@@ -4,7 +4,10 @@ import { useAuthStore } from "@/stores/auth-store";
 // Next.js server) proxies /api to the Go services. A hard-coded localhost here
 // means "the user's own machine" in production, not the backend host.
 const DEFAULT_API_BASE = "/api";
-const DEFAULT_AUTH_API_BASE = "/api/auth";
+// One origin prefix for every service. API paths in this codebase are written
+// with their own service prefix ("/api/v1/auth/login"), so the auth client must
+// share the same base — "/api/auth" produced /api/auth/api/v1/auth/login.
+const DEFAULT_AUTH_API_BASE = "/api";
 
 type PublicEnv = Record<string, string | undefined>;
 
@@ -24,8 +27,39 @@ export function joinUrl(base: string, path: string): string {
   return `${trimmedBase}${trimmedPath}`;
 }
 
+/**
+ * Build the request href from a base and a path that may already carry the same
+ * prefix.
+ *
+ * API paths are written absolute ("/api/v1/bets") while the base may already be
+ * "/api" (the production default), which used to produce "/api/api/v1/bets" and
+ * a 404 behind nginx. A path that starts with the base's last segment is
+ * therefore rebased onto the base instead of duplicated.
+ */
+export function buildApiHref(base: string, path: string, query = ""): string {
+  const trimmedBase = base.endsWith("/") ? base.slice(0, -1) : base;
+  let trimmedPath = path.startsWith("/") ? path : `/${path}`;
+
+  const lastSegment = trimmedBase.slice(trimmedBase.lastIndexOf("/"));
+  if (lastSegment.length > 1) {
+    if (
+      trimmedPath === lastSegment ||
+      trimmedPath.startsWith(`${lastSegment}/`)
+    ) {
+      trimmedPath = trimmedPath.slice(lastSegment.length);
+    }
+  }
+
+  const href = joinUrl(trimmedBase, trimmedPath || "/");
+  return query ? `${href}${href.includes("?") ? "&" : "?"}${query}` : href;
+}
+
 export function resolveAuthApiBaseUrl(env: PublicEnv = process.env): string {
-  return env.NEXT_PUBLIC_AUTH_API_URL || env.NEXT_PUBLIC_API_URL || DEFAULT_AUTH_API_BASE;
+  return (
+    env.NEXT_PUBLIC_AUTH_API_URL ||
+    env.NEXT_PUBLIC_API_URL ||
+    DEFAULT_AUTH_API_BASE
+  );
 }
 
 export interface ApiResponse<T> {
@@ -51,32 +85,31 @@ function normalizeApiError(raw: unknown, fallbackMessage: string): ApiError {
       payload.error && typeof payload.error === "object"
         ? (payload.error as Record<string, unknown>)
         : null;
-    const legacyError = typeof payload.error === "string" ? payload.error : null;
+    const legacyError =
+      typeof payload.error === "string" ? payload.error : null;
     const message =
       typeof nestedError?.message === "string"
         ? nestedError.message
         : typeof payload.message === "string"
-        ? payload.message
-        : legacyError ?? fallbackMessage;
+          ? payload.message
+          : legacyError ?? fallbackMessage;
 
     return {
       code:
         typeof nestedError?.code === "string"
           ? nestedError.code
           : typeof payload.code === "string"
-          ? payload.code
-          : "UNKNOWN_ERROR",
+            ? payload.code
+            : "UNKNOWN_ERROR",
       message,
       details:
         nestedError?.details && typeof nestedError.details === "object"
           ? (nestedError.details as Record<string, unknown>)
           : payload.details && typeof payload.details === "object"
-          ? (payload.details as Record<string, unknown>)
-          : undefined,
+            ? (payload.details as Record<string, unknown>)
+            : undefined,
       request_id:
-        typeof payload.request_id === "string"
-          ? payload.request_id
-          : "unknown",
+        typeof payload.request_id === "string" ? payload.request_id : "unknown",
     };
   }
 
@@ -90,17 +123,27 @@ function normalizeApiError(raw: unknown, fallbackMessage: string): ApiError {
 export class ApiClientError extends Error {
   constructor(
     public status: number,
-    public error: ApiError
+    public error: ApiError,
   ) {
     super(error.message);
     this.name = "ApiClientError";
   }
 
-  get isNotFound() { return this.status === 404; }
-  get isUnauthorized() { return this.status === 401; }
-  get isForbidden() { return this.status === 403; }
-  get isValidation() { return this.status === 422; }
-  get isRateLimited() { return this.status === 429; }
+  get isNotFound() {
+    return this.status === 404;
+  }
+  get isUnauthorized() {
+    return this.status === 401;
+  }
+  get isForbidden() {
+    return this.status === 403;
+  }
+  get isValidation() {
+    return this.status === 422;
+  }
+  get isRateLimited() {
+    return this.status === 429;
+  }
 }
 
 class ApiClient {
@@ -117,7 +160,7 @@ class ApiClient {
       body?: unknown;
       params?: Record<string, string>;
       headers?: Record<string, string>;
-    } = {}
+    } = {},
   ): Promise<T> {
     // `new URL("/api/v1/...")` throws TypeError: Invalid URL, because the base
     // is relative in production (NEXT_PUBLIC_API_URL=/api). Build the href by
@@ -126,13 +169,17 @@ class ApiClient {
     if (options.params) {
       Object.entries(options.params).forEach(([k, v]) => query.set(k, v));
     }
-    const queryString = query.toString();
-    const href = `${joinUrl(this.baseUrl, path)}${queryString ? `?${queryString}` : ""}`;
+    const href = buildApiHref(this.baseUrl, path, query.toString());
 
-    const { accessToken, refreshTokens, logout } =
-      useAuthStore.getState();
+    const { accessToken, refreshTokens, logout } = useAuthStore.getState();
 
     let token = accessToken;
+
+    // One idempotency key per logical request, reused by the retry after a
+    // session refresh: regenerating it inside `makeRequest` would make a failed
+    // first attempt and its retry look like two different deposits.
+    const idempotencyKey =
+      method === "GET" || method === "HEAD" ? undefined : crypto.randomUUID();
 
     const makeRequest = async (t: string | null): Promise<T> => {
       const requestId = crypto.randomUUID();
@@ -141,10 +188,15 @@ class ApiClient {
       try {
         response = await fetch(href, {
           method,
+          // Send the HttpOnly session cookies. They are the primary credential
+          // for browser sessions; the Authorization header below is kept for
+          // clients that still hold a token (and for the refresh flow).
+          credentials: "include",
           headers: {
             "Content-Type": "application/json",
             ...(t ? { Authorization: `Bearer ${t}` } : {}),
             "X-Request-ID": requestId,
+            ...(idempotencyKey ? { "X-Idempotency-Key": idempotencyKey } : {}),
             ...options.headers,
           },
           body: options.body ? JSON.stringify(options.body) : undefined,
@@ -171,21 +223,23 @@ class ApiClient {
           request_id: requestId,
         });
       }
-      
+
       if (!response.ok) {
         const payload = await response.json().catch(() => null);
         const error = normalizeApiError(payload, response.statusText);
         throw new ApiClientError(response.status, error);
       }
-      
+
       return response.json();
     };
 
     try {
       return await makeRequest(token);
     } catch (error) {
-      // Auto-refresh token on 401
-      if (error instanceof ApiClientError && error.isUnauthorized && token) {
+      // Auto-refresh on 401. Without a token in memory (cookie session) the
+      // refresh endpoint still works: the refresh token travels in its HttpOnly
+      // cookie, which is why the condition no longer requires `token`.
+      if (error instanceof ApiClientError && error.isUnauthorized) {
         try {
           await refreshTokens();
           token = useAuthStore.getState().accessToken;

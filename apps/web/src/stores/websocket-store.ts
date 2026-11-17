@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { normalizeWsUrl } from '@/lib/websocket'
 
 interface OddsUpdate {
   eventId: string
@@ -38,7 +39,9 @@ export const useWebSocketStore = create<WebSocketState>((set, get) => ({
   betSettlements: [],
 
   connect: () => {
-    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080'
+    // Cookies (not a URL token) authenticate the handshake, so the socket is
+    // opened against the same origin the session cookie belongs to.
+    const wsUrl = normalizeWsUrl(process.env.NEXT_PUBLIC_WS_URL)
     
     try {
       ws = new WebSocket(wsUrl)

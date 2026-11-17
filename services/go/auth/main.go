@@ -32,7 +32,15 @@ import (
 func corsOriginsFromEnv(devDefault string) string {
 	raw := strings.TrimSpace(os.Getenv("CORS_ORIGINS"))
 	if raw == "" {
-		raw = devDefault
+		// The localhost fallback is only acceptable for a local run: shipping it
+		// to production silently enables cross-origin cookie traffic from whatever
+		// happens to listen on port 3000 of the operator's machine.
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV"))) {
+		case "development", "dev", "local", "test":
+			raw = devDefault
+		default:
+			raw = ""
+		}
 	}
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))

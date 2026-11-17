@@ -12,6 +12,12 @@ pub struct AppConfig {
 
     pub cache_url: String,
 
+    /// Base64 Ed25519 public key of the Go auth service. Handshake tokens are
+    /// verified against it; when it is empty the gateway refuses every upgrade
+    /// (503) instead of trusting an unverified user id.
+    #[serde(default)]
+    pub auth_ed25519_public_key: String,
+
     #[serde(default = "default_max_connections")]
     pub max_connections: u64,
 

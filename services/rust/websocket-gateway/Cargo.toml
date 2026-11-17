@@ -38,6 +38,10 @@ redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 # Message broker
 rdkafka = { version = "0.36", features = ["tokio"] }
 
+# JWT verification for the WebSocket handshake (Ed25519 / EdDSA).
+jwt-simple = { version = "0.12", default-features = false, features = ["jwe", "pure-rust"] }
+base64 = "0.22"
+
 # Logging & tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

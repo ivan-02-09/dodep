@@ -13,8 +13,28 @@ import (
 )
 
 const refreshCookieName = "admin_refresh_token"
-const refreshCookiePath = "/admin/auth"
 const refreshCookieMaxAge = 7 * 24 * 3600 // 7 days
+
+// legacyRefreshCookiePath is the path used before Phase 0.5. The admin SPA
+// reaches the BFF through nginx at /admin-api/, so a cookie scoped to
+// /admin/auth was never sent back and refresh silently failed. The constant is
+// kept so logout can also expire any cookie a browser still holds.
+const legacyRefreshCookiePath = "/admin/auth"
+
+// refreshCookiePath is where the browser will send the refresh cookie. It
+// defaults to "/" because the SPA and the API share the admin origin and the
+// public path prefix is deployment-specific (/admin-api/ in production, the
+// Vite proxy in development). A path that does not match the browser-visible
+// URL makes the cookie invisible to /refresh, which is exactly the bug this
+// replaces. Override with ADMIN_REFRESH_COOKIE_PATH when the API is mounted
+// under a hard-coded prefix.
+func refreshCookiePath() string {
+	p := strings.TrimSpace(os.Getenv("ADMIN_REFRESH_COOKIE_PATH"))
+	if p == "" || !strings.HasPrefix(p, "/") {
+		return "/"
+	}
+	return p
+}
 
 // cookieSecure reads $COOKIE_SECURE; defaults to true (production-safe).
 // Set COOKIE_SECURE=false only for local http://localhost development.
@@ -29,7 +49,7 @@ func setRefreshCookie(c *fiber.Ctx, refreshToken string) {
 	c.Cookie(&fiber.Cookie{
 		Name:     refreshCookieName,
 		Value:    refreshToken,
-		Path:     refreshCookiePath,
+		Path:     refreshCookiePath(),
 		MaxAge:   refreshCookieMaxAge,
 		Expires:  time.Now().Add(time.Duration(refreshCookieMaxAge) * time.Second),
 		HTTPOnly: true,
@@ -39,18 +59,25 @@ func setRefreshCookie(c *fiber.Ctx, refreshToken string) {
 }
 
 // clearRefreshCookie expires the refresh cookie immediately. Path/Name MUST
-// match setRefreshCookie or the browser will keep the old cookie.
+// match setRefreshCookie or the browser will keep the old cookie, so both the
+// current and the legacy path are expired.
 func clearRefreshCookie(c *fiber.Ctx) {
-	c.Cookie(&fiber.Cookie{
-		Name:     refreshCookieName,
-		Value:    "",
-		Path:     refreshCookiePath,
-		MaxAge:   -1,
-		Expires:  time.Unix(0, 0),
-		HTTPOnly: true,
-		Secure:   cookieSecure(),
-		SameSite: "Strict",
-	})
+	paths := []string{refreshCookiePath()}
+	if paths[0] != legacyRefreshCookiePath {
+		paths = append(paths, legacyRefreshCookiePath)
+	}
+	for _, path := range paths {
+		c.Cookie(&fiber.Cookie{
+			Name:     refreshCookieName,
+			Value:    "",
+			Path:     path,
+			MaxAge:   -1,
+			Expires:  time.Unix(0, 0),
+			HTTPOnly: true,
+			Secure:   cookieSecure(),
+			SameSite: "Strict",
+		})
+	}
 }
 
 // RegisterPublicAdminAuthRoutes registers admin auth endpoints that MUST NOT

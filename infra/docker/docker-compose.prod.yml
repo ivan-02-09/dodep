@@ -357,6 +357,10 @@ services:
       # Port nginx proxies as ws_upstream.
       APP__HTTP_PORT: 8082
       APP__MAX_CONNECTIONS: "100000"
+      # Handshake tokens are EdDSA-signed by the auth service; without the
+      # public key the gateway refuses every upgrade (503) instead of trusting
+      # the user id in the query string.
+      APP__AUTH_ED25519_PUBLIC_KEY: ${JWT_ED25519_PUBLIC_KEY}
       CORS_ORIGINS: ${CORS_ORIGINS}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       RUST_LOG: info
@@ -408,6 +412,10 @@ services:
       WEB_APP_URL: ${APP_BASE_URL}
       APP_ENV: ${APP_ENV:-production}
       CORS_ORIGINS: ${CORS_ORIGINS}
+      # Session cookies for the web client: Secure by default, SameSite
+      # overridable for a cross-site deployment.
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      COOKIE_SAMESITE: ${COOKIE_SAMESITE:-strict}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI}

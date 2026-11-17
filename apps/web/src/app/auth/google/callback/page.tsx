@@ -7,11 +7,9 @@ import { useAuthStore } from "@/stores/auth-store";
 function GoogleCallbackInner() {
   const router = useRouter();
   const params = useSearchParams();
-  const { setTokens, fetchUser } = useAuthStore();
+  const { fetchUser } = useAuthStore();
 
   useEffect(() => {
-    const accessToken = params.get("access_token");
-    const refreshToken = params.get("refresh_token");
     const errorCode = params.get("error_code");
     const errorMessage = params.get("error_message");
 
@@ -22,16 +20,13 @@ function GoogleCallbackInner() {
       return;
     }
 
-    if (!accessToken || !refreshToken) {
-      router.replace("/login?error=AUTH_OAUTH_INVALID_CALLBACK");
-      return;
-    }
-
-    setTokens(accessToken, refreshToken);
+    // The auth service already set the HttpOnly session cookies on the redirect
+    // that landed here, so there is nothing to read from the URL: just confirm
+    // the session works and move on.
     fetchUser()
       .then(() => router.replace("/sportsbook"))
       .catch(() => router.replace("/login?error=AUTH_OAUTH_USER_FETCH_FAILED"));
-  }, [fetchUser, params, router, setTokens]);
+  }, [fetchUser, params, router]);
 
   return (
     <div className="min-h-[calc(100vh-4rem)] flex items-center justify-center px-4">

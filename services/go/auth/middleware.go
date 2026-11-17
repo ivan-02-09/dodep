@@ -13,18 +13,24 @@ import (
 // On success, sets "user_id" (int64) and "session_id" (string) in Locals.
 func AuthMiddleware(authService *service.AuthService) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		token := ""
 		authHeader := c.Get("Authorization")
-		if authHeader == "" {
-			return writeAPIError(c, fiber.StatusUnauthorized, "AUTH_MISSING_TOKEN", "missing Authorization header", nil)
+		if authHeader != "" {
+			// Extract Bearer token
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+				return writeAPIError(c, fiber.StatusUnauthorized, "AUTH_INVALID_TOKEN", "invalid Authorization header format", nil)
+			}
+			token = parts[1]
+		} else {
+			// Browser sessions carry an HttpOnly cookie instead of a header, so
+			// the access token is never exposed to JavaScript (and therefore not
+			// to an XSS payload or to localStorage dumps).
+			token = c.Cookies(AccessCookieName)
+			if token == "" {
+				return writeAPIError(c, fiber.StatusUnauthorized, "AUTH_MISSING_TOKEN", "missing Authorization header or session cookie", nil)
+			}
 		}
-
-		// Extract Bearer token
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			return writeAPIError(c, fiber.StatusUnauthorized, "AUTH_INVALID_TOKEN", "invalid Authorization header format", nil)
-		}
-
-		token := parts[1]
 
 		// Validate token via AuthService (checks JWT signature + session exists)
 		claims, err := authService.ValidateToken(c.Context(), token)
