@@ -91,7 +91,7 @@ describe("authStore transitions", () => {
         "admin-1",
         "boss@example.com",
         "The Boss",
-        "FINANCE_MANAGER",
+        "FINANCE",
         ["transaction.view", "reports.view"],
       );
 
@@ -99,7 +99,7 @@ describe("authStore transitions", () => {
     expect(state.adminId).toBe("admin-1");
     expect(state.adminEmail).toBe("boss@example.com");
     expect(state.adminName).toBe("The Boss");
-    expect(state.adminRole).toBe("FINANCE_MANAGER");
+    expect(state.adminRole).toBe("FINANCE");
     expect(state.permissions).toEqual(["transaction.view", "reports.view"]);
     // A remembered profile alone must not unlock the UI.
     expect(state.isAuthenticated).toBe(false);
@@ -174,7 +174,7 @@ describe("authStore persistence", () => {
           adminId: "admin-9",
           adminEmail: "kyc@example.com",
           adminName: "KYC Officer",
-          adminRole: "KYC_OFFICER",
+          adminRole: "RISK",
           permissions: ["kyc.review", "kyc.sof_review"],
         },
         version: 0,
@@ -185,7 +185,7 @@ describe("authStore persistence", () => {
 
     expect(state.adminId).toBe("admin-9");
     expect(state.adminEmail).toBe("kyc@example.com");
-    expect(state.adminRole).toBe("KYC_OFFICER");
+    expect(state.adminRole).toBe("RISK");
     expect(state.permissions).toEqual(["kyc.review", "kyc.sof_review"]);
     expect(state.isAuthenticated).toBe(true);
     // Tokens are memory-only and must never come back from disk.

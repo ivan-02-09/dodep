@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -40,6 +41,16 @@ type ServiceConfig struct {
 	Timeout        time.Duration
 	MaxRecvMsgSize int
 	MaxSendMsgSize int
+}
+
+// isDevelopmentEnv reports whether the environment allows local defaults.
+func isDevelopmentEnv(env string) bool {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "development", "dev", "local", "test":
+		return true
+	default:
+		return false
+	}
 }
 
 func Load() *Config {
@@ -93,7 +104,11 @@ func (c *Config) Validate() error {
 	if c == nil {
 		return fmt.Errorf("config is nil")
 	}
-	if c.Env == "development" {
+	// Treat anything that is not explicitly a development/local environment as
+	// production: the previous check only skipped validation for the exact string
+	// "development", so APP_ENV=dev or "" ran with the production rules anyway —
+	// while an operator setting APP_ENV=DEV expected the relaxed ones.
+	if isDevelopmentEnv(c.Env) {
 		return nil
 	}
 
@@ -143,6 +158,10 @@ func (c *Config) Validate() error {
 	if !c.CookieSecure {
 		misconfigured = append(misconfigured,
 			"COOKIE_SECURE must be true outside development")
+	}
+	if port, err := strconv.Atoi(strings.TrimSpace(c.HTTPPort)); err != nil || port < 1 || port > 65535 {
+		misconfigured = append(misconfigured,
+			fmt.Sprintf("HTTP_PORT must be a port number, got %q", c.HTTPPort))
 	}
 	if strings.TrimSpace(c.CORSOrigins) == "" {
 		misconfigured = append(misconfigured, "CORS_ORIGINS is empty")

@@ -8,13 +8,16 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
+	"github.com/opus-casino/admin-bff/internal/middleware"
 	"github.com/opus-casino/admin-bff/internal/models"
 	"github.com/opus-casino/admin-bff/internal/service"
 	commonv1 "github.com/opus-casino/proto/gen/go/common/v1"
 )
 
 func RegisterFinanceRoutes(router fiber.Router, svc *service.FinanceService, db *gorm.DB, log *zap.Logger) {
-	finance := router.Group("/finance")
+	// Financial data is role-restricted: support and CRM must not read the
+	// ledger, and only finance roles may post adjustments.
+	finance := router.Group("/finance", middleware.RequirePermission("finance.read"))
 
 	finance.Get("/deposits", func(c *fiber.Ctx) error {
 		status := parseTransactionStatus(c.Query("status", ""))

@@ -143,7 +143,7 @@ func RegisterPublicAdminAuthRoutes(router fiber.Router, db *gorm.DB, log *zap.Lo
 // RegisterProtectedAdminAuthRoutes registers admin auth endpoints that REQUIRE
 // a valid admin JWT (logout, me). The router is expected to be the protected
 // "/admin" group, with AdminAuth middleware already applied.
-func RegisterProtectedAdminAuthRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, jwtSecret string) {
+func RegisterProtectedAdminAuthRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, jwtSecret string) *service.AdminAuthService {
 	svc := service.NewAdminAuthService(db, jwtSecret)
 	auth := router.Group("/auth")
 
@@ -216,4 +216,7 @@ func RegisterProtectedAdminAuthRoutes(router fiber.Router, db *gorm.DB, log *zap
 		}
 		return c.JSON(fiber.Map{"data": admin})
 	})
+
+	// Shared with the protected route groups that need step-up TOTP checks.
+	return svc
 }

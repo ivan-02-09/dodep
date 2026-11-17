@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/opus-casino/admin-bff/internal/middleware"
 	"github.com/opus-casino/admin-bff/internal/models"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
@@ -12,7 +13,9 @@ import (
 )
 
 func RegisterSettingsRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger) {
-	system := router.Group("/system")
+	// System settings and the audit log are read-only for most roles; every
+	// mutating route below additionally requires settings.write.
+	system := router.Group("/system", middleware.RequirePermission("settings.read"))
 	settings := system.Group("/settings")
 
 	// System settings key-value store
@@ -28,7 +31,7 @@ func RegisterSettingsRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger) {
 		return c.JSON(fiber.Map{"data": result})
 	})
 
-	settings.Put("", func(c *fiber.Ctx) error {
+	settings.Put("", middleware.RequirePermission("settings.write"), func(c *fiber.Ctx) error {
 		var req map[string]string
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
@@ -56,7 +59,9 @@ func RegisterSettingsRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger) {
 	})
 
 	// Admin Users Management (under /admin/users/admin)
-	adminUsers := router.Group("/users/admin")
+	// Admin management is restricted to `admin` and `super_admin`; support and
+	// finance must not be able to reset another admin's TOTP or password.
+	adminUsers := router.Group("/users/admin", middleware.RequirePermission("admin.manage"))
 
 	// Audit Logs (under /admin/system/audit-logs)
 	audit := system.Group("/audit-logs")
@@ -260,7 +265,7 @@ func RegisterSettingsRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger) {
 		return c.JSON(fiber.Map{"data": items})
 	})
 
-	ipwl.Post("", func(c *fiber.Ctx) error {
+	ipwl.Post("", middleware.RequirePermission("settings.write"), func(c *fiber.Ctx) error {
 		var req struct {
 			IPAddress string `json:"ip_address"`
 			Label     string `json:"label"`
@@ -287,7 +292,7 @@ func RegisterSettingsRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger) {
 		return c.Status(201).JSON(fiber.Map{"data": entry})
 	})
 
-	ipwl.Delete("/:id", func(c *fiber.Ctx) error {
+	ipwl.Delete("/:id", middleware.RequirePermission("settings.write"), func(c *fiber.Ctx) error {
 		if err := db.Where("id = ?", c.Params("id")).Delete(&models.IPWhitelistEntry{}).Error; err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "database error"})
 		}
@@ -308,7 +313,7 @@ func RegisterSettingsRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger) {
 		return c.JSON(fiber.Map{"data": cfg})
 	})
 
-	settings.Put("/frequency-caps", func(c *fiber.Ctx) error {
+	settings.Put("/frequency-caps", middleware.RequirePermission("settings.write"), func(c *fiber.Ctx) error {
 		var req models.FrequencyCap
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})

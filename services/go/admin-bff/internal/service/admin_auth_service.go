@@ -31,6 +31,10 @@ var (
 	ErrTokenExpired       = errors.New("token expired")
 	ErrTOTPRequired       = errors.New("totp_required")
 	ErrInvalidTOTP        = errors.New("invalid or expired totp challenge")
+	// ErrInvalidTOTPCode is a wrong/expired 6-digit code for an enrolled admin.
+	ErrInvalidTOTPCode = errors.New("invalid totp code")
+	// ErrTOTPNotConfigured means step-up auth cannot be performed at all.
+	ErrTOTPNotConfigured = errors.New("totp not configured for this admin")
 )
 
 // LoginResult is returned by Login.
@@ -265,6 +269,45 @@ func (s *AdminAuthService) VerifyTOTP(ctx context.Context, challengeToken, totpC
 	return &LoginResult{Admin: &admin, AccessToken: access, RefreshToken: refresh}, nil
 }
 
+// VerifyTOTPForAdmin checks a TOTP code against one admin's stored secret.
+//
+// Used for step-up authentication on sensitive operations (balance adjustment,
+// player merge, admin management): a live session is not enough, the operator
+// must prove possession of the second factor again.
+//
+// Returns ErrTOTPNotConfigured when the admin has no TOTP secret, so the caller
+// can answer with a distinguishable error instead of a generic 401.
+func (s *AdminAuthService) VerifyTOTPForAdmin(ctx context.Context, adminID int64, code string) error {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return ErrTOTPRequired
+	}
+	if s.db == nil {
+		return ErrTOTPNotConfigured
+	}
+
+	var admin models.AdminUser
+	if err := s.db.WithContext(ctx).First(&admin, adminID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrTOTPNotConfigured
+		}
+		return fmt.Errorf("load admin: %w", err)
+	}
+	if admin.TOTPSecret == nil || !admin.TOTPEnabled {
+		return ErrTOTPNotConfigured
+	}
+
+	secret, err := s.decryptTOTPSecret(ctx, *admin.TOTPSecret)
+	if err != nil {
+		return err
+	}
+	// `Validate` uses the default 30s period and a ±1 step skew window.
+	if !otptotp.Validate(code, secret) {
+		return ErrInvalidTOTPCode
+	}
+	return nil
+}
+
 // issueTokenPair generates access+refresh tokens, creates a session, and updates last_login.
 func (s *AdminAuthService) issueTokenPair(ctx context.Context, admin *models.AdminUser, ip, ua string) (string, string, error) {
 	now := time.Now()
@@ -275,11 +318,11 @@ func (s *AdminAuthService) issueTokenPair(ctx context.Context, admin *models.Adm
 		"last_login_ip": ip,
 	})
 
-	accessToken, err := s.generateToken(admin.ID, admin.Role, admin.Permissions, s.jwtExpiry)
+	accessToken, err := s.generateTokenFor(admin.ID, admin.Email, admin.Role, admin.Permissions, s.jwtExpiry)
 	if err != nil {
 		return "", "", fmt.Errorf("generate access token: %w", err)
 	}
-	refreshToken, err := s.generateToken(admin.ID, admin.Role, admin.Permissions, s.refreshExpiry)
+	refreshToken, err := s.generateTokenFor(admin.ID, admin.Email, admin.Role, admin.Permissions, s.refreshExpiry)
 	if err != nil {
 		return "", "", fmt.Errorf("generate refresh token: %w", err)
 	}
@@ -345,8 +388,8 @@ func (s *AdminAuthService) Refresh(ctx context.Context, refreshToken string) (st
 	now := time.Now()
 	s.db.WithContext(ctx).Model(&sess).Update("revoked_at", now)
 
-	access, _ := s.generateToken(admin.ID, admin.Role, admin.Permissions, s.jwtExpiry)
-	refresh, _ := s.generateToken(admin.ID, admin.Role, admin.Permissions, s.refreshExpiry)
+	access, _ := s.generateTokenFor(admin.ID, admin.Email, admin.Role, admin.Permissions, s.jwtExpiry)
+	refresh, _ := s.generateTokenFor(admin.ID, admin.Email, admin.Role, admin.Permissions, s.refreshExpiry)
 	hash, _ := bcrypt.GenerateFromPassword([]byte(refresh), bcrypt.DefaultCost)
 	newSess := models.AdminSession{
 		AdminID:          admin.ID,
@@ -447,6 +490,15 @@ func (s *AdminAuthService) Me(ctx context.Context, adminID int64) (*models.Admin
 }
 
 func (s *AdminAuthService) generateToken(adminID int64, role string, perms []string, expiry time.Duration) (string, error) {
+	return s.generateTokenFor(adminID, "", role, perms, expiry)
+}
+
+// generateTokenFor mints a token that also carries the admin's e-mail.
+//
+// Audit rows and the withdrawal queue display the operator's name; the e-mail is
+// the only human-readable identifier available at signing time, and without it
+// `approved_by_name` was always empty.
+func (s *AdminAuthService) generateTokenFor(adminID int64, email, role string, perms []string, expiry time.Duration) (string, error) {
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"admin_id":    adminID,
@@ -454,6 +506,9 @@ func (s *AdminAuthService) generateToken(adminID int64, role string, perms []str
 		"permissions": perms,
 		"iat":         now.Unix(),
 		"exp":         now.Add(expiry).Unix(),
+	}
+	if email != "" {
+		claims["email"] = email
 	}
 	// Use Ed25519 when key is loaded; fall back to HS256 for dev/migration period.
 	if s.ed25519Priv != nil {

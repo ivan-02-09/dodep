@@ -47,7 +47,7 @@ describe("ProtectedRoute", () => {
   it("renders the children once the admin holds the required permission", () => {
     useAuthStore.setState({
       isAuthenticated: true,
-      permissions: getPermissionsForRole("SUPPORT_AGENT"),
+      permissions: getPermissionsForRole("SUPPORT"),
     });
 
     renderAt("/users", "user.view");

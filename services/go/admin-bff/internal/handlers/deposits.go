@@ -5,12 +5,13 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/opus-casino/admin-bff/internal/middleware"
 	"github.com/opus-casino/admin-bff/internal/models"
 	"gorm.io/gorm"
 )
 
 func RegisterDepositRoutes(router fiber.Router, db *gorm.DB) {
-	deposits := router.Group("/deposits")
+	deposits := router.Group("/deposits", middleware.RequirePermission("deposits.read"))
 
 	// List deposits with filters
 	deposits.Get("/", func(c *fiber.Ctx) error {

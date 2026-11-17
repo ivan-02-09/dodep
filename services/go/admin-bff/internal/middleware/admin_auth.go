@@ -125,23 +125,141 @@ func AdminAuth(jwtSecret string, db *pgxpool.Pool) fiber.Handler {
 
 		c.Locals("admin_id", claims["admin_id"])
 		c.Locals("admin_role", claims["role"])
+		// Handlers record who approved/awarded what; without this locals entry
+		// every `approved_by_name` was written as NULL.
+		if email, ok := claims["email"].(string); ok {
+			c.Locals("admin_name", email)
+		}
 		c.Locals("permissions", claims["permissions"])
 
 		return c.Next()
 	}
 }
 
+// RolePermissions is the permission set implied by a role.
+//
+// `RequirePermission` used to be dead code: no route ever applied it, so every
+// authenticated admin — including a `viewer` — could approve withdrawals and
+// adjust balances. Roles are the coarse contract used by the existing seed data;
+// explicit `admin_users.permissions` entries extend the role, they never
+// subtract from it (an operator cannot lock themselves out by accident).
+var RolePermissions = map[string][]string{
+	"super_admin": {"*"},
+	"admin": {
+		"players.read", "players.write", "players.adjust_balance",
+		"withdrawals.read", "withdrawals.approve", "withdrawals.decline",
+		"deposits.read", "deposits.write",
+		"finance.read", "finance.write",
+		"kyc.read", "kyc.write",
+		"bonuses.read", "bonuses.write",
+		"casino.read", "casino.write",
+		"sports.read", "sports.write",
+		"risk.read", "risk.write",
+		"crm.read", "crm.write",
+		"reports.read", "settings.read", "settings.write",
+		"affiliates.read", "affiliates.write",
+		"audit.read", "admin.manage",
+	},
+	// Support can look at players and tickets but must not move money.
+	"support": {
+		"players.read", "withdrawals.read", "deposits.read",
+		"kyc.read", "bonuses.read", "crm.read", "crm.write",
+		"support.read", "support.write", "reports.read",
+	},
+	"finance": {
+		"players.read", "withdrawals.read", "withdrawals.approve",
+		"withdrawals.decline", "deposits.read", "deposits.write",
+		"finance.read", "finance.write", "reports.read", "audit.read",
+	},
+	"risk": {
+		"players.read", "withdrawals.read", "risk.read", "risk.write",
+		"reports.read", "audit.read",
+	},
+	"viewer": {
+		"players.read", "withdrawals.read", "deposits.read", "finance.read",
+		"bonuses.read", "casino.read", "sports.read", "risk.read", "crm.read",
+		"reports.read", "audit.read",
+	},
+}
+
+// RoleFromLocal resolves the admin role placed in the request context by
+// `AdminAuth`. It is exported so handlers can apply role-level rules.
+func RoleFromLocal(c *fiber.Ctx) string {
+	role, _ := c.Locals("admin_role").(string)
+	return role
+}
+
+// RequirePermission rejects the request unless the admin holds `perm`.
+//
+// The JWT stores `permissions` as a JSON array, which the jwt v5 decoder yields
+// as `[]interface{}`. The previous implementation only understood that shape and
+// therefore denied every request whenever the claim was absent, while a token
+// carrying a single string slipped through untyped.
 func RequirePermission(perm string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		perms, ok := c.Locals("permissions").([]interface{})
-		if !ok {
-			return c.Status(403).JSON(fiber.Map{"error": "forbidden"})
+		if hasPermission(c, perm) {
+			return c.Next()
 		}
-		for _, p := range perms {
-			if p == perm {
+		return c.Status(403).JSON(fiber.Map{"error": "permission denied", "required": perm})
+	}
+}
+
+// RequireAnyPermission passes when the admin holds at least one of `perms`.
+func RequireAnyPermission(perms ...string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		for _, perm := range perms {
+			if hasPermission(c, perm) {
 				return c.Next()
 			}
 		}
-		return c.Status(403).JSON(fiber.Map{"error": "permission denied"})
+		return c.Status(403).JSON(fiber.Map{"error": "permission denied", "required_any": perms})
+	}
+}
+
+func hasPermission(c *fiber.Ctx, perm string) bool {
+	role, _ := c.Locals("admin_role").(string)
+	// The database stores snake_case (`super_admin`, see cmd/seed), while the
+	// admin UI and some tokens use UPPER_SNAKE. Normalise so both forms resolve.
+	role = strings.ToLower(strings.TrimSpace(role))
+	granted := map[string]struct{}{}
+
+	for _, p := range RolePermissions[role] {
+		if p == "*" {
+			return true
+		}
+		granted[p] = struct{}{}
+	}
+
+	for _, p := range permissionStrings(c.Locals("permissions")) {
+		if p == "*" {
+			return true
+		}
+		granted[p] = struct{}{}
+	}
+
+	_, ok := granted[perm]
+	return ok
+}
+
+// permissionStrings normalises the several shapes a claims array can take.
+func permissionStrings(raw any) []string {
+	switch v := raw.(type) {
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		return v
+	case string:
+		if v == "" {
+			return nil
+		}
+		return strings.Split(v, ",")
+	default:
+		return nil
 	}
 }

@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -743,10 +745,30 @@ func adminIDString(c *fiber.Ctx) string {
 	return ""
 }
 
+// adminIDInt64 resolves the acting admin from the Fiber locals.
+//
+// `AdminAuth` copies the claim straight out of `jwt.MapClaims`, where every
+// number is decoded as float64. The previous implementation only accepted
+// int64, so it returned nil for real tokens: audit rows were written with a
+// NULL admin_id and every step-up check answered 401.
 func adminIDInt64(c *fiber.Ctx) *int64 {
-	adminIDRaw := c.Locals("admin_id")
-	if v, ok := adminIDRaw.(int64); ok {
+	switch v := c.Locals("admin_id").(type) {
+	case int64:
 		return &v
+	case int:
+		id := int64(v)
+		return &id
+	case float64:
+		id := int64(v)
+		return &id
+	case json.Number:
+		if id, err := v.Int64(); err == nil {
+			return &id
+		}
+	case string:
+		if id, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return &id
+		}
 	}
 	return nil
 }

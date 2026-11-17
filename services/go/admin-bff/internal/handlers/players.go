@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/opus-casino/admin-bff/internal/middleware"
 	"github.com/opus-casino/admin-bff/internal/models"
 	"github.com/opus-casino/admin-bff/internal/service"
 	"github.com/shopspring/decimal"
@@ -47,13 +49,17 @@ func (PlayerMergeRecord) TableName() string { return "player_merge_records" }
 // RegisterPlayerRoutes mounts all player mutator and merge endpoints.
 // usersSvc is used for downstream User Service gRPC calls (limits, blocks).
 // It may be nil in tests; endpoints degrade to audit-only with 502 on failure.
-func RegisterPlayerRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, auditSvc *service.AuditService, usersSvc *service.UsersService) {
+func RegisterPlayerRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, auditSvc *service.AuditService, usersSvc *service.UsersService, authSvc *service.AdminAuthService) {
 	// Auto-migrate the local tables managed by this handler.
 	if err := db.AutoMigrate(&PlayerNote{}, &PlayerMergeRecord{}); err != nil {
 		log.Error("player auto-migration failed", zap.Error(err))
 	}
 
-	players := router.Group("/players")
+	// Every player route requires at least read access; the mutating endpoints
+	// additionally require `players.write` / `players.adjust_balance` below.
+	// Before this, any authenticated admin (a `viewer` included) could read and
+	// mutate any player: RequirePermission existed but was never applied.
+	players := router.Group("/players", middleware.RequirePermission("players.read"))
 
 	// ── List players ──────────────────────────────────────────────────────────
 	players.Get("/", listPlayers(db, log))
@@ -97,12 +103,13 @@ func RegisterPlayerRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, aud
 		if err := c.BodyParser(&req); err != nil || req.Reason == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "reason required"})
 		}
-		// TODO: call User Service gRPC BlockPlayer when available.
-		// For now, record the action in audit log and acknowledge.
+		// BlockPlayer is not wired into the BFF, so the account stays open. Only
+		// the audit record is written — and the response says so.
 		logAudit(auditSvc, c, "player.block", "player", c.Params("id"), fiber.Map{
 			"type": req.Type, "duration_hours": req.DurationHours, "reason": req.Reason,
+			"applied": false,
 		})
-		return c.JSON(fiber.Map{"success": true, "message": "player block recorded; propagate via User Service gRPC"})
+		return notImplemented(c, "BLOCK_UNAVAILABLE", "the player was NOT blocked: User Service BlockPlayer is not wired")
 	})
 
 	players.Post("/:id/unblock", func(c *fiber.Ctx) error {
@@ -112,8 +119,8 @@ func RegisterPlayerRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, aud
 		if err := c.BodyParser(&req); err != nil || req.Reason == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "reason required"})
 		}
-		logAudit(auditSvc, c, "player.unblock", "player", c.Params("id"), fiber.Map{"reason": req.Reason})
-		return c.JSON(fiber.Map{"success": true})
+		logAudit(auditSvc, c, "player.unblock", "player", c.Params("id"), fiber.Map{"reason": req.Reason, "applied": false})
+		return notImplemented(c, "UNBLOCK_UNAVAILABLE", "the player was NOT unblocked: User Service UnblockPlayer is not wired")
 	})
 
 	// ── Limits (propagated to User Service gRPC SetLimits) ───────────────────
@@ -170,30 +177,10 @@ func RegisterPlayerRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, aud
 	})
 
 	// ── Adjust Balance (requires TOTP confirmation in the request body) ─────────
-	players.Post("/:id/adjust-balance", func(c *fiber.Ctx) error {
-		var req struct {
-			Amount   string `json:"amount"`
-			Currency string `json:"currency"`
-			Type     string `json:"type"` // credit|debit
-			Reason   string `json:"reason"`
-			TOTPCode string `json:"totp_code"`
-		}
-		if err := c.BodyParser(&req); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
-		}
-		if req.Reason == "" || req.Amount == "" || req.Type == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "amount, type, and reason required"})
-		}
-		if req.TOTPCode == "" {
-			return c.Status(403).JSON(fiber.Map{"error": "TOTP_REQUIRED", "message": "totp_code is required for balance adjustments"})
-		}
-		// TODO: validate req.TOTPCode against current admin TOTP secret.
-		// TODO: call Wallet Service gRPC CreditDebit.
-		logAudit(auditSvc, c, "player.balance.adjust", "player", c.Params("id"), fiber.Map{
-			"amount": req.Amount, "currency": req.Currency, "type": req.Type, "reason": req.Reason,
-		})
-		return c.JSON(fiber.Map{"success": true})
-	})
+	players.Post("/:id/adjust-balance",
+		middleware.RequirePermission("players.adjust_balance"),
+		adjustBalance(authSvc, auditSvc),
+	)
 
 	// ── Tags ──────────────────────────────────────────────────────────────────
 	players.Post("/:id/tags", func(c *fiber.Ctx) error {
@@ -205,11 +192,12 @@ func RegisterPlayerRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, aud
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
 		}
-		// TODO: call User Service gRPC UpdateTags.
+		// User Service gRPC UpdateTags is not implemented yet: report it instead of
+		// a silent success.
 		logAudit(auditSvc, c, "player.tags.update", "player", c.Params("id"), fiber.Map{
-			"add": req.Add, "remove": req.Remove, "reason": req.Reason,
+			"add": req.Add, "remove": req.Remove, "reason": req.Reason, "applied": false,
 		})
-		return c.JSON(fiber.Map{"success": true})
+		return notImplemented(c, "TAGS_UNAVAILABLE", "tags were not changed: User Service UpdateTags is not wired")
 	})
 
 	// ── Player Group ──────────────────────────────────────────────────────────
@@ -222,9 +210,9 @@ func RegisterPlayerRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, aud
 			return c.Status(400).JSON(fiber.Map{"error": "group and reason required"})
 		}
 		logAudit(auditSvc, c, "player.group.set", "player", c.Params("id"), fiber.Map{
-			"group": req.Group, "reason": req.Reason,
+			"group": req.Group, "reason": req.Reason, "applied": false,
 		})
-		return c.JSON(fiber.Map{"success": true})
+		return notImplemented(c, "GROUP_UNAVAILABLE", "the group was NOT changed: the user service has no group endpoint")
 	})
 
 	// ── Give Bonus ────────────────────────────────────────────────────────────
@@ -271,9 +259,14 @@ func RegisterPlayerRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, aud
 			db.Create(&sof)
 		}
 		logAudit(auditSvc, c, "player.kyc.request", "player", c.Params("id"), fiber.Map{
-			"type": req.Type, "message": req.Message,
+			"type": req.Type, "message": req.Message, "applied": req.Type == "source_of_funds",
 		})
-		return c.JSON(fiber.Map{"success": true})
+		if req.Type != "source_of_funds" {
+			// Only SOF requests reach the database; identity/address requests used
+			// to return 200 without doing anything.
+			return notImplemented(c, "KYC_REQUEST_UNAVAILABLE", "identity/address KYC requests are not dispatched yet")
+		}
+		return c.JSON(fiber.Map{"success": true, "applied": true})
 	})
 
 	// ── Send Message ──────────────────────────────────────────────────────────
@@ -296,11 +289,11 @@ func RegisterPlayerRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, aud
 				"reason": sup.Reason,
 			})
 		}
-		// TODO: dispatch via CRM/notification service.
+		// The notification service is not wired into the BFF: nothing is sent.
 		logAudit(auditSvc, c, "player.message.send", "player", c.Params("id"), fiber.Map{
-			"channel": req.Channel, "subject": req.Subject,
+			"channel": req.Channel, "subject": req.Subject, "applied": false,
 		})
-		return c.JSON(fiber.Map{"success": true})
+		return notImplemented(c, "MESSAGE_UNAVAILABLE", "the message was NOT sent: notification service is not wired")
 	})
 
 	// ── Player Merge (B2.1) — SUPER_ADMIN + TOTP + second SUPER_ADMIN confirm ──
@@ -398,8 +391,20 @@ func RegisterPlayerRoutes(router fiber.Router, db *gorm.DB, log *zap.Logger, aud
 	})
 
 	players.Delete("/:id/suppressions/:sup_id", func(c *fiber.Ctx) error {
-		db.Where("id = ? AND player_id = ?", c.Params("sup_id"), c.Params("id")).
+		res := db.Where("id = ? AND player_id = ?", c.Params("sup_id"), c.Params("id")).
 			Delete(&models.CommunicationSuppression{})
+		if res.Error != nil {
+			log.Error("suppression delete failed", zap.Error(res.Error))
+			return c.Status(500).JSON(fiber.Map{"error": "database error"})
+		}
+		// A missing row used to be reported as success, so the UI removed a
+		// suppression that was already gone (or never existed).
+		if res.RowsAffected == 0 {
+			return c.Status(404).JSON(fiber.Map{"error": "suppression not found"})
+		}
+		logAudit(auditSvc, c, "player.suppression.remove", "player", c.Params("id"), fiber.Map{
+			"suppression_id": c.Params("sup_id"),
+		})
 		return c.JSON(fiber.Map{"success": true})
 	})
 }
@@ -546,4 +551,87 @@ func getPlayerOverview(db *gorm.DB, log *zap.Logger) fiber.Handler {
 			},
 		})
 	}
+}
+
+// adjustBalance credits or debits a player's wallet.
+//
+// Two problems were fixed here: the TOTP code was only checked for presence (a
+// stolen session could invent money), and any authenticated admin could call it
+// because no permission was required.
+func adjustBalance(authSvc *service.AdminAuthService, auditSvc *service.AuditService) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		var req struct {
+			Amount   string `json:"amount"`
+			Currency string `json:"currency"`
+			Type     string `json:"type"` // credit|debit
+			Reason   string `json:"reason"`
+			TOTPCode string `json:"totp_code"`
+		}
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
+		}
+		if req.Reason == "" || req.Amount == "" || req.Type == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "amount, type, and reason required"})
+		}
+		if req.Type != "credit" && req.Type != "debit" {
+			return c.Status(400).JSON(fiber.Map{"error": "type must be credit or debit"})
+		}
+		if _, err := decimal.NewFromString(req.Amount); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "amount must be a decimal"})
+		}
+		if req.TOTPCode == "" {
+			return c.Status(403).JSON(fiber.Map{
+				"error":   "TOTP_REQUIRED",
+				"message": "totp_code is required for balance adjustments",
+			})
+		}
+
+		adminID := adminIDInt64(c)
+		if adminID == nil {
+			return c.Status(401).JSON(fiber.Map{"error": "unauthenticated"})
+		}
+
+		err := authSvc.VerifyTOTPForAdmin(c.Context(), *adminID, req.TOTPCode)
+		switch {
+		case err == nil:
+			// second factor confirmed
+		case errors.Is(err, service.ErrTOTPNotConfigured):
+			return c.Status(403).JSON(fiber.Map{
+				"error":   "TOTP_NOT_CONFIGURED",
+				"message": "enrol a TOTP device before adjusting balances",
+			})
+		case errors.Is(err, service.ErrTOTPRequired):
+			return c.Status(403).JSON(fiber.Map{"error": "TOTP_REQUIRED"})
+		default:
+			return c.Status(403).JSON(fiber.Map{"error": "INVALID_TOTP"})
+		}
+
+		// The wallet is not reachable from the BFF yet, so the balance is NOT
+		// changed. Answering 200 with `success: true` would tell the operator the
+		// money moved when nothing happened.
+		logAudit(auditSvc, c, "player.balance.adjust", "player", c.Params("id"), fiber.Map{
+			"amount": req.Amount, "currency": req.Currency, "type": req.Type, "reason": req.Reason,
+			"applied": false,
+		})
+		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{
+			"success": false,
+			"applied": false,
+			"error":   "BALANCE_ADJUST_UNAVAILABLE",
+			"message": "the audit record was written, but wallet-core is not wired into the BFF; no funds moved",
+		})
+	}
+}
+
+// notImplemented reports an action that only produced an audit record.
+//
+// These endpoints used to answer 200 `success: true` while doing nothing, which
+// made the admin UI claim that a player was blocked, tagged or messaged. 501 is
+// the honest answer until the downstream services are wired.
+func notImplemented(c *fiber.Ctx, code, message string) error {
+	return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{
+		"success": false,
+		"applied": false,
+		"error":   code,
+		"message": message,
+	})
 }

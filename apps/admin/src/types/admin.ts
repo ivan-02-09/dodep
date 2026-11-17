@@ -1,15 +1,18 @@
+/**
+ * Admin roles.
+ *
+ * These are the roles the backend actually stores and authorises
+ * (`admin_users.role` + middleware.RolePermissions in admin-bff). The previous
+ * list (FINANCE_MANAGER, KYC_OFFICER, …) matched nothing the API issued, so the
+ * UI fell back to "no permissions" and hid every page after login.
+ */
 export type AdminRole =
   | "SUPER_ADMIN"
-  | "FINANCE_MANAGER"
-  | "RISK_MANAGER"
-  | "CRM_MANAGER"
-  | "SPORTS_TRADER"
-  | "SUPPORT_AGENT"
-  | "KYC_OFFICER"
-  | "AFFILIATE_MANAGER"
-  | "CONTENT_MANAGER"
-  | "VIEWER"
-  | "COMPLIANCE_OFFICER";
+  | "ADMIN"
+  | "FINANCE"
+  | "RISK"
+  | "SUPPORT"
+  | "VIEWER";
 
 export type Permission =
   // Player

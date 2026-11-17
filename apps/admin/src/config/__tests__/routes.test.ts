@@ -5,16 +5,11 @@ import type { AdminRole, Permission } from "@/types/admin";
 
 const ALL_ROLES: AdminRole[] = [
   "SUPER_ADMIN",
-  "FINANCE_MANAGER",
-  "RISK_MANAGER",
-  "CRM_MANAGER",
-  "SPORTS_TRADER",
-  "SUPPORT_AGENT",
-  "KYC_OFFICER",
-  "AFFILIATE_MANAGER",
-  "CONTENT_MANAGER",
+  "ADMIN",
+  "FINANCE",
+  "RISK",
+  "SUPPORT",
   "VIEWER",
-  "COMPLIANCE_OFFICER",
 ];
 
 /** Every permission the role matrix is capable of granting. */
@@ -131,10 +126,16 @@ describe("routeConfig integrity", () => {
         .map((r) => r.path);
 
     expect(visibleTo(superAdmin)).toEqual(leafPaths);
+    // A viewer may read finance pages (the backend grants `finance.read`), but
+    // every mutating screen stays hidden.
     expect(visibleTo(viewer)).toEqual([
       "/dashboard",
       "/users",
       "/users/:id",
+      "/finance/deposits",
+      "/finance/withdrawals",
+      "/finance/transactions",
+      "/finance/chargebacks",
       "/sports/bets",
       "/reports/financial",
       "/reports/player",

@@ -158,11 +158,13 @@ func main() {
 		middleware.RateLimitAPI(rdb),
 	)
 
-	handlers.RegisterProtectedAdminAuthRoutes(admin, db, log, cfg.JWTSecretKey)
+	// One shared auth service: the login routes and the step-up TOTP checks on
+	// sensitive handlers must agree on the same Vault/Ed25519 configuration.
+	adminAuthSvc := handlers.RegisterProtectedAdminAuthRoutes(admin, db, log, cfg.JWTSecretKey)
 	handlers.RegisterDashboardRoutes(admin, db, log, auditSvc)
 	handlers.RegisterUserRoutes(admin, usersSvc, log)
 	handlers.RegisterFinanceRoutes(admin, financeSvc, db, log)
-	handlers.RegisterPlayerRoutes(admin, db, log, auditSvc, usersSvc)
+	handlers.RegisterPlayerRoutes(admin, db, log, auditSvc, usersSvc, adminAuthSvc)
 	handlers.RegisterCRMRoutes(admin, db, log, auditSvc)
 	handlers.RegisterWSRoutes(admin, wsHub, log)
 
@@ -173,7 +175,7 @@ func main() {
 	// Apply withdrawal-specific rate limiting
 	admin.Post("/withdrawals/:id/approve", middleware.RateLimitWithdrawalApprove(rdb))
 	admin.Post("/players/:id/adjust-balance", middleware.RateLimitBalanceAdjust(rdb))
-	handlers.RegisterWithdrawalRoutes(admin, db)
+	handlers.RegisterWithdrawalRoutes(admin, db, log, auditSvc)
 	handlers.RegisterBonusRoutes(admin, db)
 	handlers.RegisterRiskRoutes(admin, db, log, auditSvc)
 	handlers.RegisterSportsRoutes(admin, db, log, bettingClient, auditSvc)
