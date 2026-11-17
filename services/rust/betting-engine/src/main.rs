@@ -8,8 +8,6 @@ use std::net::SocketAddr;
 use betting_engine::api;
 use betting_engine::config::AppConfig;
 use betting_engine::grpc::server::start_grpc;
-use betting_engine::services::bet_service::BetService;
-use betting_engine::services::settlement_service::SettlementService;
 use betting_engine::state::AppState;
 use tokio::signal;
 use tracing::info;
@@ -23,6 +21,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = AppConfig::load()?;
+    // Fail fast on a configuration that would let bets move no money.
+    config.validate()?;
 
     info!(
         service = %config.service_name,
@@ -46,16 +46,14 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], config.http_port));
     info!(%addr, "HTTP server listening");
 
-    // gRPC runs alongside HTTP; share the state's services so both transports
-    // observe the same pool and repository.
+    // gRPC runs alongside HTTP and must use the SAME service instances: they
+    // are the ones wired to wallet-core. Building fresh services here (as this
+    // code used to do) silently dropped the wallet client on the gRPC path.
+    let grpc_bet_service = state.bet_service().clone();
+    let grpc_settlement_service = state.settlement_service().clone();
+
     let grpc_handle = tokio::spawn(async move {
-        let repo = state.bet_repository();
-        let result = start_grpc(
-            grpc_port,
-            BetService::new(repo.clone()),
-            SettlementService::new(repo),
-        )
-        .await;
+        let result = start_grpc(grpc_port, grpc_bet_service, grpc_settlement_service).await;
         if let Err(e) = result {
             tracing::error!(error = %e, "gRPC server exited");
         }

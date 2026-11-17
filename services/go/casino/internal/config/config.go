@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/opus-casino/casino/internal/provider/amatic"
@@ -32,6 +33,11 @@ type Config struct {
 	// JWT Ed25519 public key (base64-encoded DER)
 	JWTPublicKey string
 
+	// Default currency (ISO 4217) for wallet reads/writes and for the currency
+	// handed to the slot providers. Providers require one explicit code per
+	// session; it used to be the literal "USD" while wallets are multi-currency.
+	DefaultCurrency string
+
 	// Environment
 	Env string
 
@@ -51,14 +57,15 @@ func Load() *Config {
 		GRPCPort: grpcPort,
 		HTTPPort: getEnv("PORT", "8086"),
 
-		DatabaseURL:    getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/opus_casino?sslmode=disable"),
-		RedisAddr:      getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
-		RedisPassword:  getEnv("REDIS_PASSWORD", ""),
-		RedisDB:        getIntEnv("REDIS_DB", 0),
-		WalletGRPCAddr: getEnv("WALLET_GRPC_ADDR", "localhost:50053"),
-		UserGRPCAddr:   getEnv("USER_GRPC_ADDR", "localhost:50052"),
-		JWTPublicKey:   getEnv("JWT_ED25519_PUBLIC_KEY", ""),
-		Env:            getEnv("APP_ENV", "development"),
+		DatabaseURL:     getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/opus_casino?sslmode=disable"),
+		RedisAddr:       getEnv("REDIS_HOST", "localhost") + ":" + getEnv("REDIS_PORT", "6379"),
+		RedisPassword:   getEnv("REDIS_PASSWORD", ""),
+		RedisDB:         getIntEnv("REDIS_DB", 0),
+		WalletGRPCAddr:  getEnv("WALLET_GRPC_ADDR", "localhost:50053"),
+		UserGRPCAddr:    getEnv("USER_GRPC_ADDR", "localhost:50052"),
+		JWTPublicKey:    getEnv("JWT_ED25519_PUBLIC_KEY", ""),
+		DefaultCurrency: defaultCurrency(),
+		Env:             getEnv("APP_ENV", "development"),
 
 		Pragmatic: pragmatic.Config{
 			Enabled:         getBoolEnv("PRAGMATIC_ENABLED", false),
@@ -99,6 +106,20 @@ func Load() *Config {
 			ReplayWindowSec: getIntEnv("AMUSNET_REPLAY_WINDOW_SEC", replayWindow),
 		},
 	}
+}
+
+// defaultCurrency normalises DEFAULT_CURRENCY.
+//
+// An empty variable (or one with only spaces) is a common compose mistake and
+// would otherwise be passed to the wallet and the slot providers as "", which
+// they reject. The service performs the same normalisation, but failing here
+// keeps `Load()` self-consistent.
+func defaultCurrency() string {
+	code := strings.ToUpper(strings.TrimSpace(getEnv("DEFAULT_CURRENCY", "USD")))
+	if code == "" {
+		return "USD"
+	}
+	return code
 }
 
 func getEnv(key, defaultValue string) string {

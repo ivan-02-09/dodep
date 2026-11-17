@@ -47,11 +47,13 @@ impl LockRepository {
     /// Get active lock by reference ID
     pub async fn get_active_by_reference(
         &self,
-        reference_id: Uuid,
+        reference_id: &str,
     ) -> Result<Option<FundLock>, sqlx::Error> {
         let sql = format!(
             "SELECT {LOCK_COLUMNS} FROM fund_locks WHERE reference_id = $1 AND is_active = true"
         );
+        // reference_id is VARCHAR(255) since migration 023, so business ids
+        // that are not UUIDs (bet ids) work here too.
         let lock = sqlx::query_as::<_, FundLock>(&sql)
             .bind(reference_id)
             .fetch_optional(&self.pool)

@@ -45,7 +45,7 @@ impl LedgerRepository {
         .bind(&entry.currency)
         .bind(entry.balance_after)
         .bind(entry.reference_type.as_deref())
-        .bind(entry.reference_id)
+        .bind(entry.reference_id.as_deref())
         .bind(entry.idempotency_key.as_deref())
         .execute(&mut **tx)
         .await?;

@@ -276,6 +276,10 @@ services:
       GRPC__ADDR: 0.0.0.0:50053
       # Port nginx proxies as wallet_upstream and the healthcheck probes.
       HTTP__ADDR: 0.0.0.0:8081
+      # Currency for wallets opened without an explicit Money.currency. It used
+      # to be a hardcoded "USD" in the gRPC handlers.
+      APP__DEFAULT_CURRENCY: ${DEFAULT_CURRENCY:-USD}
+      APP__ENV: ${APP_ENV:-production}
       TRACING__OTLP_ENDPOINT: http://jaeger:4317
       RUST_LOG: info
     depends_on:
@@ -312,12 +316,20 @@ services:
       APP__AUTH_ED25519_PUBLIC_KEY: ${JWT_ED25519_PUBLIC_KEY}
       APP__SPORTRADAR_API_KEY: ${SPORTRADAR_API_KEY}
       APP__SPORTRADAR_LIVE_ODDS_WS: ${SPORTRADAR_LIVE_ODDS_WS}
+      # Bets lock the stake in wallet-core and settlements move the money;
+      # without this address the engine books bets nobody paid for.
+      APP__WALLET_SERVICE_ADDR: http://wallet-core:50053
+      APP__WALLET_ENABLED: "true"
+      APP__DEFAULT_CURRENCY: ${DEFAULT_CURRENCY:-USD}
+      APP__ENV: ${APP_ENV:-production}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       RUST_LOG: info
     depends_on:
       postgres:
         condition: service_healthy
       dragonfly:
+        condition: service_healthy
+      wallet-core:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8080/healthz"]
@@ -529,6 +541,10 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       WALLET_GRPC_ADDR: wallet-core:50053
       USER_GRPC_ADDR: user:50052
+      # Currency handed to the slot providers and asked of the wallet. Providers
+      # take one code per session, so it cannot be derived per request; the
+      # service hardcoded "USD" before this variable existed.
+      DEFAULT_CURRENCY: ${DEFAULT_CURRENCY:-USD}
       KAFKA_BROKERS: ${KAFKA_BROKERS:-redpanda:9092}
       PRAGMATIC_ENABLED: ${PRAGMATIC_ENABLED:-false}
       PRAGMATIC_AGENT_ID: ${PRAGMATIC_AGENT_ID}

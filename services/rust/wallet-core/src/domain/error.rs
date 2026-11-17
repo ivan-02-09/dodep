@@ -7,11 +7,11 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum WalletError {
     #[error("Wallet not found for user {user_id:?}")]
-    NotFound { user_id: uuid::Uuid },
+    NotFound { user_id: i64 },
 
     #[error("Wallet already exists for user {user_id:?} and type {wallet_type:?}")]
     AlreadyExists {
-        user_id: uuid::Uuid,
+        user_id: i64,
         wallet_type: crate::domain::WalletType,
     },
 

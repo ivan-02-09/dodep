@@ -21,7 +21,9 @@ use super::{AccountType, LedgerEntryType, TransactionStatus, TransactionType, Wa
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Wallet {
     pub id: Uuid,
-    pub user_id: Uuid,
+    /// Platform user id (`users.id BIGSERIAL`), not a UUID: see
+    /// `023_wallet_lock_settlement.sql`.
+    pub user_id: i64,
     pub wallet_type: WalletType,
     pub currency: String,
     pub balance_available: Decimal,
@@ -35,7 +37,7 @@ pub struct Wallet {
 
 impl Wallet {
     /// Create a new wallet
-    pub fn new(user_id: Uuid, wallet_type: WalletType, currency: String) -> Self {
+    pub fn new(user_id: i64, wallet_type: WalletType, currency: String) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -67,11 +69,20 @@ impl Wallet {
         self.balance_available + self.balance_bonus >= amount
     }
 
-    /// Get account ID for ledger entries
+    /// Ledger account id for this wallet.
+    ///
+    /// The format must match `wallet_reconciliation` in migration 023, which
+    /// builds `'user_wallet:' || user_id || ':' || wallet_type::text || ':' ||
+    /// currency`. `wallet_type::text` is the snake_case DB label ('main'), so
+    /// the previous `{:?}` Debug rendering ('Main') put every ledger entry in an
+    /// account the reconciliation view could never find — the check silently
+    /// reported a full-balance discrepancy for every wallet.
     pub fn ledger_account_id(&self) -> String {
         format!(
-            "user_wallet:{}:{:?}:{}",
-            self.user_id, self.wallet_type, self.currency
+            "user_wallet:{}:{}:{}",
+            self.user_id,
+            self.wallet_type.as_str(),
+            self.currency
         )
     }
 }
@@ -102,14 +113,16 @@ impl Balance {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Transaction {
     pub id: Uuid,
-    pub user_id: Uuid,
+    pub user_id: i64,
     pub wallet_id: Uuid,
     pub wallet_type: WalletType,
     pub transaction_type: TransactionType,
     pub amount: Decimal,
     pub currency: String,
     pub status: TransactionStatus,
-    pub reference_id: Option<Uuid>,
+    /// Business reference owned by another service (bet id, withdrawal id, …).
+    /// VARCHAR(255) since migration 023 — not necessarily a UUID.
+    pub reference_id: Option<String>,
     pub reference_type: Option<String>,
     pub idempotency_key: Option<String>,
     pub description: Option<String>,
@@ -122,13 +135,13 @@ pub struct Transaction {
 /// Fields needed to open a new transaction.
 #[derive(Debug, Clone)]
 pub struct NewTransaction {
-    pub user_id: Uuid,
+    pub user_id: i64,
     pub wallet_id: Uuid,
     pub wallet_type: WalletType,
     pub transaction_type: TransactionType,
     pub amount: Decimal,
     pub currency: String,
-    pub reference_id: Option<Uuid>,
+    pub reference_id: Option<String>,
     pub reference_type: Option<String>,
     pub idempotency_key: Option<String>,
 }
@@ -182,9 +195,9 @@ impl Transaction {
 pub struct FundLock {
     pub id: Uuid,
     pub wallet_id: Uuid,
-    pub user_id: Uuid,
+    pub user_id: i64,
     pub amount: Decimal,
-    pub reference_id: Uuid,
+    pub reference_id: String,
     pub reference_type: String,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
@@ -194,9 +207,9 @@ pub struct FundLock {
 impl FundLock {
     pub fn new(
         wallet_id: Uuid,
-        user_id: Uuid,
+        user_id: i64,
         amount: Decimal,
-        reference_id: Uuid,
+        reference_id: String,
         reference_type: String,
     ) -> Self {
         Self {
@@ -237,7 +250,7 @@ pub struct LedgerEntry {
     pub currency: String,
     pub balance_after: Option<Decimal>, // Snapshot of account balance
     pub reference_type: Option<String>,
-    pub reference_id: Option<Uuid>,
+    pub reference_id: Option<String>,
     pub idempotency_key: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -340,7 +353,7 @@ pub struct LedgerEntryWithRef {
     pub currency: String,
     pub balance_after: Option<Decimal>,
     pub reference_type: String,
-    pub reference_id: Uuid,
+    pub reference_id: String,
     pub idempotency_key: Option<String>,
 }
 
@@ -400,7 +413,7 @@ impl OutboxEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ReconciliationResult {
     pub wallet_id: Uuid,
-    pub user_id: Uuid,
+    pub user_id: i64,
     pub wallet_type: WalletType,
     pub currency: String,
     pub actual_balance: Decimal,

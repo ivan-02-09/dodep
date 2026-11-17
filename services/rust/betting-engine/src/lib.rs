@@ -11,3 +11,4 @@ pub mod middleware;
 pub mod repositories;
 pub mod services;
 pub mod state;
+pub mod wallet;

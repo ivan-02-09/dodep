@@ -24,7 +24,7 @@ impl WalletRepository {
     /// Get wallet by user and type
     pub async fn get_by_user_and_type(
         &self,
-        user_id: Uuid,
+        user_id: i64,
         wallet_type: WalletType,
     ) -> Result<Option<Wallet>, WalletError> {
         let sql = format!(
@@ -47,7 +47,7 @@ impl WalletRepository {
     /// Get wallet by user and type within a transaction (with row lock)
     pub async fn get_by_user_and_type_internal(
         &self,
-        user_id: Uuid,
+        user_id: i64,
         wallet_type: WalletType,
         tx: &mut Transaction<'_, Postgres>,
     ) -> Result<Option<Wallet>, WalletError> {

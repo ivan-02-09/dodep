@@ -51,6 +51,21 @@ pub struct AppConfig {
     /// Odds cache TTL in seconds for pre-match events.
     #[serde(default = "default_odds_prematch_ttl")]
     pub odds_prematch_ttl_secs: u64,
+
+    /// wallet-core gRPC endpoint. Bets lock the stake here and settlements move
+    /// the money; without it the engine can only write bookkeeping rows.
+    #[serde(default = "default_wallet_service_addr")]
+    pub wallet_service_addr: String,
+
+    /// Must be `true` in production. `false` lets the engine run without
+    /// wallet-core (local development) by skipping every money movement.
+    #[serde(default = "default_wallet_enabled")]
+    pub wallet_enabled: bool,
+
+    /// Currency used when a bet request does not carry one. Mirrors
+    /// `wallet-core`'s `APP__DEFAULT_CURRENCY`.
+    #[serde(default = "default_currency")]
+    pub default_currency: String,
 }
 
 impl AppConfig {
@@ -89,4 +104,39 @@ fn default_odds_live_ttl() -> u64 {
 }
 fn default_odds_prematch_ttl() -> u64 {
     30 // 30 seconds for pre-match events
+}
+fn default_wallet_service_addr() -> String {
+    "http://wallet-core:50053".into()
+}
+fn default_wallet_enabled() -> bool {
+    true
+}
+fn default_currency() -> String {
+    "USD".into()
+}
+
+impl AppConfig {
+    /// Refuse to start with money movements silently disabled in production.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.default_currency.trim().is_empty() {
+            anyhow::bail!("APP__DEFAULT_CURRENCY must not be empty");
+        }
+        if !self.wallet_enabled && self.environment_is_production() {
+            anyhow::bail!(
+                "APP__WALLET_ENABLED=false is not allowed in production: bets would not move money"
+            );
+        }
+        Ok(())
+    }
+
+    fn environment_is_production(&self) -> bool {
+        std::env::var("APP__ENV")
+            .map(|env| env.eq_ignore_ascii_case("production"))
+            .unwrap_or(false)
+    }
+
+    /// Normalised ISO code used for new bets.
+    pub fn currency(&self) -> String {
+        self.default_currency.trim().to_uppercase()
+    }
 }

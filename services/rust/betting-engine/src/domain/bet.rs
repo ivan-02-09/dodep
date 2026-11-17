@@ -97,6 +97,14 @@ impl BetStatus {
             (self, target),
             (BetStatus::Pending, BetStatus::Active)
                 | (BetStatus::Pending, BetStatus::Rejected)
+                // A bet is settled straight from `pending` whenever it was never
+                // explicitly activated (see migration 005: the column defaults to
+                // 'pending', and nothing used to move it to 'active', so every
+                // settlement failed with "bet not in active state").
+                | (BetStatus::Pending, BetStatus::Won)
+                | (BetStatus::Pending, BetStatus::Lost)
+                | (BetStatus::Pending, BetStatus::Void)
+                | (BetStatus::Pending, BetStatus::Cashout)
                 | (BetStatus::Active, BetStatus::Won)
                 | (BetStatus::Active, BetStatus::Lost)
                 | (BetStatus::Active, BetStatus::Void)
@@ -312,6 +320,10 @@ mod tests {
     fn test_bet_status_transitions() {
         assert!(BetStatus::Pending.can_transition_to(BetStatus::Active));
         assert!(BetStatus::Pending.can_transition_to(BetStatus::Rejected));
+        // Never explicitly activated bets must still be settleable.
+        assert!(BetStatus::Pending.can_transition_to(BetStatus::Won));
+        assert!(BetStatus::Pending.can_transition_to(BetStatus::Lost));
+        assert!(BetStatus::Pending.can_transition_to(BetStatus::Void));
         assert!(BetStatus::Active.can_transition_to(BetStatus::Won));
         assert!(BetStatus::Active.can_transition_to(BetStatus::Lost));
         assert!(BetStatus::Active.can_transition_to(BetStatus::Void));

@@ -170,6 +170,27 @@ impl BetRepository {
         }
     }
 
+    /// Load a bet by id without a user filter.
+    ///
+    /// Settlement runs from the back office / feed worker, where the acting
+    /// principal is the system rather than the player.
+    pub async fn get_bet(&self, bet_id: BetId) -> Result<Option<Bet>, sqlx::Error> {
+        let sql = format!("SELECT {BET_COLUMNS} FROM bets WHERE id = $1");
+        let row = sqlx::query(&sql)
+            .bind(bet_id.0)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(row) => {
+                let mut bet = Bet::from(Self::map_bet_row(&row)?);
+                bet.selections = self.get_bet_selections(bet.id).await?;
+                Ok(Some(bet))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub async fn get_user_bets(
         &self,
         user_id: UserId,
@@ -219,6 +240,27 @@ impl BetRepository {
         }
 
         Ok((bets, total))
+    }
+
+    /// Mark a fresh bet as rejected.
+    ///
+    /// Used as compensation when the stake cannot be reserved in wallet-core:
+    /// the row has already been inserted, so leaving it `pending` would show a
+    /// bet the player never paid for.
+    pub async fn reject_bet(&self, bet_id: BetId, reason: &str) {
+        if let Err(error) = sqlx::query(
+            r#"
+            UPDATE bets
+            SET status = 'rejected', updated_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            "#,
+        )
+        .bind(bet_id.0)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::error!(bet_id = %bet_id, %error, reason, "Failed to mark bet as rejected");
+        }
     }
 
     pub async fn update_bet_status(

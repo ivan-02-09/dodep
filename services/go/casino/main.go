@@ -102,7 +102,7 @@ func main() {
 	}
 
 	// ── Services ──────────────────────────────────────────────────────────
-	casinoSvc := service.NewCasinoService(casinoRepo, registry, walletClient, userClient, log)
+	casinoSvc := service.NewCasinoService(casinoRepo, registry, walletClient, userClient, log, cfg.DefaultCurrency)
 
 	integrationSvc := service.NewIntegrationService(
 		registry,

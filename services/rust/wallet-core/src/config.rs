@@ -18,6 +18,14 @@ pub struct AppConfig {
     pub env: String,
     pub name: String,
     pub version: String,
+    /// ISO 4217 code used when a request does not name a currency and a wallet
+    /// has to be created. Overridable with APP__DEFAULT_CURRENCY.
+    #[serde(default = "default_currency")]
+    pub default_currency: String,
+}
+
+fn default_currency() -> String {
+    "USD".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +106,7 @@ impl Config {
             .set_default("app.env", "development")?
             .set_default("app.name", "wallet-core")?
             .set_default("app.version", "0.1.0")?
+            .set_default("app.default_currency", "USD")?
             // Database defaults
             .set_default("database.host", "localhost")?
             .set_default("database.port", 5432)?

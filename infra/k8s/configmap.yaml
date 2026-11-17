@@ -41,6 +41,15 @@ data:
   WALLET_GRPC_ADDR: "wallet-core.opus-casino.svc.cluster.local:50053"
   USER_GRPC_ADDR: "user.opus-casino.svc.cluster.local:50052"
   BETTING_ENGINE_ADDR: "betting-engine.opus-casino.svc.cluster.local:9090"
+  # betting-engine is a wallet-core client: it locks the stake on placement and
+  # moves the money on settlement.
+  APP__WALLET_SERVICE_ADDR: "http://wallet-core.opus-casino.svc.cluster.local:50053"
+  APP__WALLET_ENABLED: "true"
+
+  # Currency used when a request carries none (new wallets, slot provider
+  # sessions, bets without an explicit code). Replaces the hardcoded "USD".
+  APP__DEFAULT_CURRENCY: "USD"
+  DEFAULT_CURRENCY: "USD"
 
   # Config-rs key/value form used by the Rust services.
   REDIS__HOST: "dragonfly.opus-casino.svc.cluster.local"

@@ -7,6 +7,7 @@ use crate::domain::bet::*;
 use crate::domain::odds::{calculate_combined_odds, calculate_potential_win};
 use crate::errors::AppError;
 use crate::repositories::bet_repo::{BetRepository, CreateBetParams, CreateSelectionParams};
+use crate::wallet::{WalletClient, WalletClientError};
 
 const MIN_STAKE: &str = "0.10";
 const MAX_STAKE: &str = "10000.00";
@@ -15,11 +16,29 @@ const MAX_PAYOUT: &str = "100000.00";
 #[derive(Clone)]
 pub struct BetService {
     bet_repo: BetRepository,
+    /// Money channel. `None` means the engine runs without wallet-core (local
+    /// development only) — the bet is then booked without reserving funds.
+    wallet: Option<WalletClient>,
+    currency: String,
 }
 
 impl BetService {
+    /// Service without a wallet connection (development / unit tests).
     pub fn new(bet_repo: BetRepository) -> Self {
-        Self { bet_repo }
+        Self {
+            bet_repo,
+            wallet: None,
+            currency: "USD".to_string(),
+        }
+    }
+
+    /// Service that reserves the stake in wallet-core before booking the bet.
+    pub fn with_wallet(bet_repo: BetRepository, wallet: WalletClient, currency: &str) -> Self {
+        Self {
+            bet_repo,
+            wallet: Some(wallet),
+            currency: currency.to_string(),
+        }
     }
 
     #[tracing::instrument(name = "service.place_bet", skip(self, req), fields(user_id = %user_id))]
@@ -55,6 +74,14 @@ impl BetService {
             })
             .collect();
 
+        // A bet must always carry the currency it was priced in; falling back to
+        // a hardcoded "USD" would book EUR stakes as dollars.
+        let currency = if req.currency_code.trim().is_empty() {
+            self.currency.clone()
+        } else {
+            req.currency_code.trim().to_uppercase()
+        };
+
         let bet = self
             .bet_repo
             .create_bet(CreateBetParams {
@@ -63,7 +90,7 @@ impl BetService {
                 stake: req.stake,
                 combined_odds,
                 potential_win,
-                currency_code: req.currency_code.clone(),
+                currency_code: currency.clone(),
                 sport_id: None,
                 event_id,
                 selections,
@@ -73,15 +100,35 @@ impl BetService {
             })
             .await?;
 
+        // Reserve the stake. The bet id is the wallet reference, so a retried
+        // request reuses the existing lock instead of reserving twice.
+        if let Some(wallet) = &self.wallet {
+            if let Err(err) = wallet
+                .lock_stake(user_id.0, bet.stake, &bet.currency_code, bet.id.0)
+                .await
+            {
+                self.bet_repo
+                    .reject_bet(bet.id, &format!("stake lock failed: {err}"))
+                    .await;
+                return Err(map_wallet_error(err));
+            }
+        }
+
         info!(
             user_id = %user_id,
             bet_id = %bet.id,
-            stake = %req.stake,
+            stake = %bet.stake,
             odds = %combined_odds,
+            %currency,
             "Bet placed"
         );
 
         Ok(bet)
+    }
+
+    /// Wallet client, when the engine is wired to wallet-core.
+    pub fn wallet(&self) -> Option<&WalletClient> {
+        self.wallet.as_ref()
     }
 
     #[tracing::instrument(name = "service.get_bet", skip(self))]
@@ -139,5 +186,40 @@ impl BetService {
         }
 
         Ok(())
+    }
+}
+
+/// Map a wallet failure onto an API error and a stable client-facing message.
+fn map_wallet_error(err: WalletClientError) -> AppError {
+    match err {
+        WalletClientError::InsufficientFunds { .. } => AppError::InsufficientBalance {
+            required: Decimal::ZERO,
+            available: Decimal::ZERO,
+        },
+        WalletClientError::Rejected(reason) => AppError::BetRejected { reason },
+        WalletClientError::Unavailable(reason) => AppError::ServiceUnavailable(reason),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insufficient_funds_maps_to_a_client_error() {
+        let err = map_wallet_error(WalletClientError::InsufficientFunds { user_id: 1 });
+        assert!(matches!(err, AppError::InsufficientBalance { .. }));
+    }
+
+    #[test]
+    fn wallet_outage_maps_to_service_unavailable() {
+        let err = map_wallet_error(WalletClientError::Unavailable("down".into()));
+        assert!(matches!(err, AppError::ServiceUnavailable(_)));
+    }
+
+    #[test]
+    fn rejection_maps_to_bet_rejected() {
+        let err = map_wallet_error(WalletClientError::Rejected("no".into()));
+        assert!(matches!(err, AppError::BetRejected { .. }));
     }
 }

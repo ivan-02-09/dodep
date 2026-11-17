@@ -298,8 +298,11 @@ async fn test_settle_already_settled_returns_conflict() {
         .settle_bet(bet.id, "lost", Decimal::ZERO)
         .await;
 
+    // The domain guard rejects the transition before any wallet call, so the
+    // caller gets a stable "already settled" error instead of a race-dependent
+    // database conflict.
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), AppError::Conflict { .. }));
+    assert!(matches!(result.unwrap_err(), AppError::BetAlreadySettled));
 }
 
 // ============================================================

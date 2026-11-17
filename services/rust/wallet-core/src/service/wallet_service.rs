@@ -21,23 +21,23 @@ use crate::service::idempotency::IdempotencyService;
 /// Request to move funds between two of a user's wallets.
 #[derive(Debug, Clone)]
 pub struct TransferRequest {
-    pub user_id: Uuid,
+    pub user_id: i64,
     pub from_wallet_type: WalletType,
     pub to_wallet_type: WalletType,
     pub amount: Decimal,
     pub currency: String,
-    pub reference_id: Uuid,
+    pub reference_id: String,
     pub idempotency_key: Option<String>,
 }
 
 /// Request to credit funds into a user's wallet.
 #[derive(Debug, Clone)]
 pub struct CreditRequest {
-    pub user_id: Uuid,
+    pub user_id: i64,
     pub wallet_type: WalletType,
     pub amount: Decimal,
     pub currency: String,
-    pub reference_id: Uuid,
+    pub reference_id: String,
     pub reference_type: String,
     pub idempotency_key: String,
 }
@@ -45,11 +45,11 @@ pub struct CreditRequest {
 /// Request to debit funds from a user's wallet.
 #[derive(Debug, Clone)]
 pub struct DebitRequest {
-    pub user_id: Uuid,
+    pub user_id: i64,
     pub wallet_type: WalletType,
     pub amount: Decimal,
     pub currency: String,
-    pub reference_id: Uuid,
+    pub reference_id: String,
     pub reference_type: String,
     pub idempotency_key: String,
 }
@@ -88,16 +88,19 @@ impl WalletService {
     #[instrument(skip(self), fields(user_id = %user_id, wallet_type = ?wallet_type))]
     pub async fn get_or_create_wallet(
         &self,
-        user_id: Uuid,
+        user_id: i64,
         wallet_type: WalletType,
         currency: &str,
     ) -> Result<Wallet, WalletError> {
-        // Try to get existing wallet
+        // Try to get existing wallet. An existing wallet keeps its currency: a
+        // request that names a different one is a caller bug, and silently
+        // accepting it would book EUR movements against a USD balance.
         if let Some(wallet) = self
             .wallet_repo
             .get_by_user_and_type(user_id, wallet_type)
             .await?
         {
+            ensure_currency(&wallet, currency)?;
             return Ok(wallet);
         }
 
@@ -146,11 +149,40 @@ impl WalletService {
         Ok(wallet)
     }
 
+    /// Load a wallet row.
+    ///
+    /// Exposed so the gRPC layer can answer with the wallet's real currency:
+    /// `get_balance` returns amounts only, and the previous code filled the
+    /// response with a hardcoded "USD" that could contradict the stored row.
+    #[instrument(skip(self), fields(user_id = %user_id, wallet_type = ?wallet_type))]
+    pub async fn get_wallet(
+        &self,
+        user_id: i64,
+        wallet_type: WalletType,
+    ) -> Result<Wallet, WalletError> {
+        self.wallet_repo
+            .get_by_user_and_type(user_id, wallet_type)
+            .await?
+            .ok_or(WalletError::NotFound { user_id })
+    }
+
+    /// Currency of an existing wallet.
+    ///
+    /// `get_balance` returns amounts only, so gRPC handlers need a way to report
+    /// the real ISO code instead of inventing one.
+    pub async fn get_currency(
+        &self,
+        user_id: i64,
+        wallet_type: WalletType,
+    ) -> Result<String, WalletError> {
+        Ok(self.get_wallet(user_id, wallet_type).await?.currency)
+    }
+
     /// Get wallet balance
     #[instrument(skip(self), fields(user_id = %user_id, wallet_type = ?wallet_type))]
     pub async fn get_balance(
         &self,
-        user_id: Uuid,
+        user_id: i64,
         wallet_type: WalletType,
     ) -> Result<Balance, WalletError> {
         let wallet = self
@@ -263,12 +295,12 @@ impl WalletService {
         let credit_entry = LedgerEntry::credit_with_ref(LedgerEntryWithRef {
             transaction_id: transaction.id,
             account_type: AccountType::UserWallet,
-            account_id: format!("user_wallet:{}:{:?}:{}", user_id, wallet_type, currency),
+            account_id: ledger_account_id(user_id, wallet_type, currency),
             amount,
             currency: currency.to_string(),
             balance_after: Some(new_available),
             reference_type: reference_type.to_string(),
-            reference_id,
+            reference_id: reference_id.clone(),
             idempotency_key: Some(idempotency_key.to_string()),
         });
 
@@ -434,7 +466,7 @@ impl WalletService {
         let debit_entry = LedgerEntry::debit_with_ref(LedgerEntryWithRef {
             transaction_id: transaction.id,
             account_type: AccountType::UserWallet,
-            account_id: format!("user_wallet:{}:{:?}:{}", user_id, wallet_type, currency),
+            account_id: ledger_account_id(user_id, wallet_type, currency),
             amount,
             currency: currency.to_string(),
             balance_after: Some(new_available),
@@ -511,12 +543,16 @@ impl WalletService {
     /// idempotency key.)
     pub async fn lock(
         &self,
-        user_id: Uuid,
+        user_id: i64,
         wallet_type: WalletType,
         amount: Decimal,
-        reference_id: Uuid,
+        reference_id: String,
     ) -> Result<FundLock, WalletError> {
-        if let Some(existing) = self.lock_repo.get_active_by_reference(reference_id).await? {
+        if let Some(existing) = self
+            .lock_repo
+            .get_active_by_reference(&reference_id)
+            .await?
+        {
             return Ok(existing);
         }
 
@@ -553,7 +589,13 @@ impl WalletService {
         )
         .await?;
 
-        let lock = FundLock::new(wallet.id, user_id, amount, reference_id, "lock".to_string());
+        let lock = FundLock::new(
+            wallet.id,
+            user_id,
+            amount,
+            reference_id.clone(),
+            "lock".to_string(),
+        );
 
         sqlx::query(
             r#"INSERT INTO fund_locks (id, wallet_id, user_id, amount, reference_id, reference_type, is_active) VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
@@ -562,7 +604,7 @@ impl WalletService {
         .bind(lock.wallet_id)
         .bind(lock.user_id)
         .bind(lock.amount)
-        .bind(lock.reference_id)
+        .bind(&lock.reference_id)
         .bind(&lock.reference_type)
         .bind(lock.is_active)
         .execute(&mut *tx)
@@ -574,7 +616,7 @@ impl WalletService {
         Ok(lock)
     }
 
-    pub async fn unlock(&self, user_id: Uuid, reference_id: Uuid) -> Result<(), WalletError> {
+    pub async fn unlock(&self, user_id: i64, reference_id: &str) -> Result<(), WalletError> {
         let mut tx = self
             .wallet_repo
             .pool
@@ -721,7 +763,7 @@ impl WalletService {
 
     pub async fn get_transactions(
         &self,
-        user_id: Uuid,
+        user_id: i64,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Transaction>, WalletError> {
@@ -750,7 +792,7 @@ impl WalletService {
 
     async fn get_or_create_wallet_internal(
         &self,
-        user_id: Uuid,
+        user_id: i64,
         wallet_type: WalletType,
         currency: &str,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -760,6 +802,7 @@ impl WalletService {
             .get_by_user_and_type_internal(user_id, wallet_type, tx)
             .await?
         {
+            ensure_currency(&wallet, currency)?;
             return Ok(wallet);
         }
 
@@ -815,7 +858,7 @@ impl WalletService {
         .bind(transaction.amount)
         .bind(&transaction.currency)
         .bind(transaction.status)
-        .bind(transaction.reference_id)
+        .bind(transaction.reference_id.as_deref())
         .bind(&transaction.reference_type)
         .bind(&transaction.idempotency_key)
         .execute(&mut **tx)
@@ -859,5 +902,95 @@ impl WalletService {
         }
 
         Ok(())
+    }
+}
+
+/// Ledger account id for a user's wallet.
+///
+/// Kept in one place because `wallet_reconciliation` (migration 023) compares
+/// `ledger_entries.account_id` against
+/// `'user_wallet:' || user_id || ':' || wallet_type::text || ':' || currency`.
+fn ledger_account_id(user_id: i64, wallet_type: WalletType, currency: &str) -> String {
+    format!(
+        "user_wallet:{}:{}:{}",
+        user_id,
+        wallet_type.as_str(),
+        currency
+    )
+}
+
+/// Reject a currency that contradicts the stored wallet.
+///
+/// Currency equality is compared case-insensitively and after trimming, so
+/// "usd" and "USD" do not trip the check, while "EUR" against a USD wallet does.
+fn ensure_currency(wallet: &Wallet, requested: &str) -> Result<(), WalletError> {
+    let requested = requested.trim();
+    if requested.is_empty() || wallet.currency.eq_ignore_ascii_case(requested) {
+        return Ok(());
+    }
+    Err(WalletError::CurrencyMismatch {
+        from: wallet.currency.clone(),
+        to: requested.to_uppercase(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wallet(currency: &str) -> Wallet {
+        // `Wallet::new` only generates an id and zeroes the balances, so no
+        // database is needed to exercise the pure helpers below.
+        let mut wallet = Wallet::new(42, WalletType::Main, currency.to_string());
+        wallet.balance_available = Decimal::new(100, 0);
+        wallet
+    }
+
+    #[test]
+    fn ledger_account_id_matches_the_reconciliation_view() {
+        // migration 023: 'user_wallet:' || user_id || ':' || wallet_type::text || ':' || currency
+        assert_eq!(
+            ledger_account_id(42, WalletType::Main, "USD"),
+            "user_wallet:42:main:USD"
+        );
+        assert_eq!(
+            wallet("EUR").ledger_account_id(),
+            "user_wallet:42:main:EUR"
+        );
+    }
+
+    #[test]
+    fn ledger_account_id_uses_snake_case_for_every_wallet_type() {
+        assert_eq!(WalletType::Bonus.as_str(), "bonus");
+        assert_eq!(WalletType::FreeSpins.as_str(), "free_spins");
+        assert_eq!(WalletType::Cashback.as_str(), "cashback");
+    }
+
+    #[test]
+    fn ensure_currency_is_case_insensitive() {
+        let wallet = wallet("USD");
+        assert!(ensure_currency(&wallet, "usd").is_ok());
+        assert!(ensure_currency(&wallet, " USD ").is_ok());
+        // An empty request means "whatever the wallet uses".
+        assert!(ensure_currency(&wallet, "").is_ok());
+    }
+
+    #[test]
+    fn ensure_currency_rejects_a_different_currency() {
+        let wallet = wallet("USD");
+        match ensure_currency(&wallet, "eur") {
+            Err(WalletError::CurrencyMismatch { from, to }) => {
+                assert_eq!(from, "USD");
+                assert_eq!(to, "EUR");
+            }
+            other => panic!("expected CurrencyMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn currency_mismatch_is_not_an_internal_error() {
+        let err: opus_shared::AppError =
+            WalletError::CurrencyMismatch { from: "USD".into(), to: "EUR".into() }.into();
+        assert!(matches!(err, opus_shared::AppError::InvalidArgument(_)));
     }
 }

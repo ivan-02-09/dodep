@@ -74,7 +74,7 @@ impl TransactionRepository {
             .bind(transaction.amount)
             .bind(&transaction.currency)
             .bind(transaction.status)
-            .bind(transaction.reference_id)
+            .bind(transaction.reference_id.as_deref())
             .bind(&transaction.reference_type)
             .bind(&transaction.idempotency_key)
             .bind(&transaction.description)

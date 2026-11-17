@@ -28,6 +28,13 @@ pub mod proto {
             tonic::include_proto!("common.v1");
         }
     }
+    /// Generated code for `wallet/v1/wallet.proto` — the betting engine is a
+    /// wallet-core *client* (stake lock, payout credit), never a server.
+    pub mod wallet {
+        pub mod v1 {
+            tonic::include_proto!("wallet.v1");
+        }
+    }
 }
 
 use proto::betting::v1::betting_engine_service_server::{
@@ -391,8 +398,19 @@ impl BettingEngineSvc for BettingEngineService {
             Ok(BetResult::Won) => "won",
             Ok(BetResult::Lost) => "lost",
             Ok(BetResult::Void) => "void",
-            Ok(BetResult::HalfWon) => "half_won",
-            Ok(BetResult::HalfLost) => "half_lost",
+            // Settlement only understands won/lost/void. Half-won/half-lost
+            // used to be forwarded verbatim, which the service rejected with a
+            // generic validation error and no explanation for the caller.
+            Ok(BetResult::HalfWon) => {
+                return Err(Status::unimplemented(
+                    "half_won settlements are not supported yet; settle as 'won' with half the payout",
+                ))
+            }
+            Ok(BetResult::HalfLost) => {
+                return Err(Status::unimplemented(
+                    "half_lost settlements are not supported yet; settle as 'lost' and refund half the stake",
+                ))
+            }
             _ => return Err(Status::invalid_argument("Missing or unknown result")),
         };
 

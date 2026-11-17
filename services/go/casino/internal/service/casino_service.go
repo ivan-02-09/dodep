@@ -24,11 +24,12 @@ type UserServiceClient interface {
 
 // CasinoService handles casino business logic
 type CasinoService struct {
-	repo      *repository.CasinoRepository
-	registry  *provider.Registry
-	wallet    WalletClient
-	userSvc   UserServiceClient
-	log       *zap.Logger
+	repo     *repository.CasinoRepository
+	registry *provider.Registry
+	wallet   WalletClient
+	userSvc  UserServiceClient
+	log      *zap.Logger
+	currency string
 }
 
 // NewCasinoService creates a new casino service.
@@ -38,13 +39,21 @@ func NewCasinoService(
 	wallet WalletClient,
 	userSvc UserServiceClient,
 	log *zap.Logger,
+	currency string,
 ) *CasinoService {
+	// currency is the ISO 4217 code requested from the wallet and sent to the
+	// slot providers. Providers take exactly one code per session, so it cannot
+	// be derived per call; it used to be the literal "USD" in three places.
+	if strings.TrimSpace(currency) == "" {
+		currency = "USD"
+	}
 	return &CasinoService{
 		repo:     repo,
 		registry: registry,
 		wallet:   wallet,
 		userSvc:  userSvc,
 		log:      log,
+		currency: strings.ToUpper(strings.TrimSpace(currency)),
 	}
 }
 
@@ -409,7 +418,7 @@ func (s *CasinoService) LaunchGame(ctx context.Context, req *LaunchGameRequest) 
 	// 5. Get current balance
 	balanceStr := "0"
 	if s.wallet != nil {
-		balance, err := s.wallet.GetBalance(ctx, userIDInt, "USD")
+		balance, err := s.wallet.GetBalance(ctx, userIDInt, s.currency)
 		if err != nil {
 			s.log.Warn("Failed to get balance for game launch", zap.Error(err))
 		} else {
@@ -434,7 +443,7 @@ func (s *CasinoService) LaunchGame(ctx context.Context, req *LaunchGameRequest) 
 			PlayerID:   playerID,
 			Token:      sessionToken,
 			GameID:     req.GameID,
-			Currency:   "USD",
+			Currency:   s.currency,
 			Balance:    decimal.RequireFromString(balanceStr),
 			Language:   "en",
 			LobbyURL:   req.LobbyURL,
